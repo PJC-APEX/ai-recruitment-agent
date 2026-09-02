@@ -1,39 +1,37 @@
-"""Embedding service using Azure OpenAI embeddings."""
+"""Embedding service using an OpenAI-compatible embeddings API."""
 
 import logging
 from typing import List
-from langchain_openai import AzureOpenAIEmbeddings
+from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
 
 class EmbeddingService:
-    """Service for generating embeddings using Azure OpenAI."""
+    """Service for generating embeddings using an OpenAI-compatible API."""
     
     def __init__(
         self,
         api_key: str,
         endpoint: str,
-        model: str = "text-embedding-ada-002",
+        model: str = "text-embedding-v3",
         api_version: str = "2024-02-15-preview"
     ):
         """Initialize embedding service.
         
         Args:
-            api_key: Azure OpenAI API key
-            endpoint: Azure OpenAI endpoint URL
-            model: Embedding model deployment name
-            api_version: Azure OpenAI API version
+            api_key: OpenAI-compatible API key
+            endpoint: OpenAI-compatible API base URL
+            model: Embedding model name
+            api_version: Retained for compatibility with existing callers
         """
         self.api_key = api_key
         self.endpoint = endpoint
         self.model = model
         self.api_version = api_version
-        self.embeddings = AzureOpenAIEmbeddings(
-            azure_endpoint=endpoint,
+        self.client = AsyncOpenAI(
             api_key=api_key,
-            model=model,
-            api_version=api_version
+            base_url=endpoint,
         )
         self.logger = logger
     
@@ -47,7 +45,11 @@ class EmbeddingService:
             Embedding vector
         """
         try:
-            embedding = await self.embeddings.aembed_query(text)
+            response = await self.client.embeddings.create(
+                model=self.model,
+                input=text,
+            )
+            embedding = response.data[0].embedding
             self.logger.debug(f"Generated embedding of dimension {len(embedding)}")
             return embedding
         except Exception as e:
@@ -64,7 +66,15 @@ class EmbeddingService:
             List of embedding vectors
         """
         try:
-            embeddings = await self.embeddings.aembed_documents(texts)
+            # DashScope's OpenAI-compatible endpoint is more reliable when
+            # each document is sent as a string rather than as a batch list.
+            embeddings = []
+            for text in texts:
+                response = await self.client.embeddings.create(
+                    model=self.model,
+                    input=text,
+                )
+                embeddings.append(response.data[0].embedding)
             self.logger.info(f"Generated {len(embeddings)} embeddings")
             return embeddings
         except Exception as e:
@@ -77,5 +87,5 @@ class EmbeddingService:
         Returns:
             Embedding dimension
         """
-        # text-embedding-ada-002 produces 1536-dimensional vectors
-        return 1536
+        # DashScope text-embedding-v3 produces 1024-dimensional vectors by default.
+        return 1024

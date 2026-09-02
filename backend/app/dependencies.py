@@ -35,8 +35,10 @@ def get_embedding_service() -> EmbeddingService:
     """Get cached embedding service instance."""
     settings = get_settings()
     return EmbeddingService(
-        api_key=settings.azure_openai_api_key,
-        endpoint=settings.azure_openai_endpoint,
+        # Embeddings use their own provider/key when configured (for example,
+        # DashScope Qwen); fall back to the chat configuration for compatibility.
+        api_key=settings.embedding_api_key or settings.azure_openai_api_key,
+        endpoint=settings.embedding_base_url or settings.azure_openai_endpoint,
         model=settings.azure_openai_embedding_model,
         api_version=settings.azure_openai_api_version
     )
@@ -95,6 +97,12 @@ def get_scoring_pipeline() -> ScoringPipeline:
     return ScoringPipeline(llm_client=llm_client)
 
 
+def get_checkpoint_db_path() -> str:
+    """Return the configured checkpoint database path."""
+    settings = get_settings()
+    return settings.checkpoint_db_path
+
+
 @lru_cache()
 def get_recruitment_agent() -> RecruitmentAgent:
     """Get cached recruitment agent instance.
@@ -119,5 +127,7 @@ def get_recruitment_agent() -> RecruitmentAgent:
         llm_client=llm_client,
         tools=tools,
         max_iterations=15,  # Allow more iterations for complex multi-candidate comparisons
-        verbose=settings.debug  # Show agent reasoning in debug mode
+        verbose=settings.debug,  # Show agent reasoning in debug mode
+        checkpoint_db_path=get_checkpoint_db_path(),
+        max_short_term_messages=settings.short_term_max_messages
     )

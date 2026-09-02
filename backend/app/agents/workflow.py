@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 def create_recruitment_workflow(
     llm,
     tools_dict: Dict[str, Any],
-    verbose: bool = False
+    verbose: bool = False,
+    checkpointer=None
 ) -> StateGraph:
     """Create the LangGraph workflow for recruitment agent.
     
@@ -89,7 +90,7 @@ def create_recruitment_workflow(
     workflow.add_edge("response_generation", END)
     
     # Compile the graph
-    compiled_workflow = workflow.compile()
+    compiled_workflow = workflow.compile(checkpointer=checkpointer)
     
     logger.info("LangGraph workflow created successfully")
     

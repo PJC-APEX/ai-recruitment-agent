@@ -1,32 +1,32 @@
-"""LLM client for Azure OpenAI API interactions."""
+"""LLM client for OpenAI-compatible API interactions."""
 
 import logging
 import json
 from typing import Dict, Any, Optional, List
-from openai import AsyncAzureOpenAI
+from openai import AsyncOpenAI
 import tiktoken
 
 logger = logging.getLogger(__name__)
 
 
 class LLMClient:
-    """Client for interacting with Azure OpenAI LLM."""
+    """Client for interacting with an OpenAI-compatible chat API."""
     
     def __init__(
         self,
         api_key: str,
         endpoint: str,
-        model: str = "gpt-4",
+        model: str = "deepseek-chat",
         api_version: str = "2024-02-15-preview",
         temperature: float = 0.7
     ):
         """Initialize LLM client.
         
         Args:
-            api_key: Azure OpenAI API key
-            endpoint: Azure OpenAI endpoint URL
-            model: Model deployment name
-            api_version: Azure OpenAI API version
+            api_key: OpenAI-compatible API key
+            endpoint: OpenAI-compatible API base URL
+            model: Model name
+            api_version: Retained for compatibility with existing callers
             temperature: Temperature for generation
         """
         self.api_key = api_key
@@ -34,10 +34,9 @@ class LLMClient:
         self.model = model
         self.api_version = api_version
         self.temperature = temperature
-        self.client = AsyncAzureOpenAI(
+        self.client = AsyncOpenAI(
             api_key=api_key,
-            azure_endpoint=endpoint,
-            api_version=api_version
+            base_url=endpoint
         )
         self.logger = logger
         

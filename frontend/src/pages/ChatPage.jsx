@@ -14,6 +14,13 @@ const ChatPage = () => {
   const [isUploading, setIsUploading] = useState(false);
   const [candidates, setCandidates] = useState([]);
   const [showUpload, setShowUpload] = useState(false);
+  const [sessionId] = useState(() => {
+    const saved = localStorage.getItem('recruitment_session_id');
+    if (saved) return saved;
+    const id = crypto.randomUUID();
+    localStorage.setItem('recruitment_session_id', id);
+    return id;
+  });
 
   /**
    * Handle sending a chat message
@@ -40,7 +47,7 @@ const ChatPage = () => {
       }));
 
       // Send message to API with full conversation history
-      const response = await sendChatMessage(inputMessage, chatHistory);
+      const response = await sendChatMessage(inputMessage, sessionId, chatHistory);
 
       // Add AI response
       const aiMessage = {

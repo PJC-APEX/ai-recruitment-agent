@@ -19,6 +19,7 @@ class ScoreResumeRequest(BaseModel):
 class ChatRequest(BaseModel):
     """Request model for chat endpoint."""
     message: str = Field(..., description="User message")
+    session_id: Optional[str] = Field(None, description="Stable conversation id for short-term memory")
     chat_history: Optional[list] = Field(default_factory=list, description="Previous conversation history")
 
 

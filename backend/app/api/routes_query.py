@@ -162,7 +162,8 @@ async def chat(
         # Let the agent autonomously decide what to do and execute
         result = await agent.process_query(
             query=request.message,
-            chat_history=chat_history
+            chat_history=chat_history,
+            session_id=request.session_id
         )
         
         if not result.get("success"):

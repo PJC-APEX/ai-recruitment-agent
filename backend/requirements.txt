@@ -7,6 +7,7 @@ langchain>=0.1.0
 langchain-openai>=0.0.5
 langchain-community>=0.0.17
 langgraph>=0.2.0
+langgraph-checkpoint-sqlite>=3.0.0
 chromadb>=1.5.0
 openai>=1.10.0
 pypdf>=4.0.0

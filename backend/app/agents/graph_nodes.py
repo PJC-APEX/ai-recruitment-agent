@@ -37,6 +37,9 @@ class GraphNodes:
         self.tools_dict = tools_dict
         self.verbose = verbose
         self.logger = logger
+        # Use LangChain's modern tool-calling interface. This maps to the
+        # OpenAI-compatible `tools` payload supported by DeepSeek.
+        self.llm_with_tools = self.llm.bind_tools(list(tools_dict.values()))
     
     def _get_system_message(self) -> str:
         """Get the system message for the agent.
@@ -139,22 +142,30 @@ Remember: The EXACT filename from list_all_candidates is the ONLY correct identi
                     content=f"Tool '{state.get('tool_name')}' returned: {state['tool_result']}"
                 ))
             
-            # Call LLM with tool schemas
-            tool_schemas = self._get_tool_schemas()
-            
             if self.verbose:
                 self.logger.info(f"[ReasoningNode] Calling LLM with {len(messages)} messages")
-            
-            response = await self.llm.ainvoke(
-                messages,
-                functions=tool_schemas
-            )
-            
-            # Check if LLM wants to call a function
-            if hasattr(response, 'additional_kwargs') and 'function_call' in response.additional_kwargs:
-                function_call = response.additional_kwargs['function_call']
-                tool_name = function_call['name']
-                tool_args = json.loads(function_call['arguments'])
+
+            # Call the model with native tool schemas. The old `functions`
+            # parameter is not reliably interpreted by DeepSeek-compatible APIs.
+            response = await self.llm_with_tools.ainvoke(messages)
+
+            # Check if LLM wants to call a tool. Keep a legacy fallback for
+            # providers that still return an OpenAI `function_call` payload.
+            tool_calls = getattr(response, "tool_calls", None) or []
+            legacy_call = getattr(response, "additional_kwargs", {}).get("function_call")
+            if tool_calls:
+                tool_call = tool_calls[0]
+                tool_name = tool_call["name"]
+                tool_args = tool_call.get("args", {})
+            elif legacy_call:
+                tool_name = legacy_call["name"]
+                raw_arguments = legacy_call.get("arguments", {})
+                tool_args = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+            else:
+                tool_name = None
+                tool_args = {}
+
+            if tool_name:
                 
                 # Prevent retry of previously failed get_candidate_details calls
                 if tool_name == 'get_candidate_details':
@@ -242,8 +253,13 @@ Remember: The EXACT filename from list_all_candidates is the ONLY correct identi
                 return state
             
             tool = self.tools_dict[tool_name]
+            # Some OpenAI-compatible models emit a placeholder argument for
+            # zero-argument tools. Do not pass it to the Python function.
+            if getattr(tool, "args_schema", None) is None and tool_args == {"__arg1": ""}:
+                tool_args = {}
             
             # Execute tool (handle both sync and async)
+            failed_identifier = None
             try:
                 if tool.coroutine:
                     result = await tool.coroutine(**tool_args)
@@ -259,7 +275,6 @@ Remember: The EXACT filename from list_all_candidates is the ONLY correct identi
                 state["tool_result"] = result
                 
                 # Track failed candidate lookups to prevent retries
-                failed_identifier = None
                 if tool_name == 'get_candidate_details' and ("Could not find resume" in result or "Could not find" in result):
                     failed_identifier = tool_args.get('identifier')
                     if failed_identifier:
@@ -307,7 +322,8 @@ Remember: The EXACT filename from list_all_candidates is the ONLY correct identi
             return {
                 "error": str(e),
                 "tool_result": f"Error: {str(e)}",
-                "needs_tool": False
+                "needs_tool": False,
+                "final_answer": f"I encountered an error while executing the requested tool: {str(e)}"
             }
     
     async def response_generation_node(self, state: AgentState) -> AgentState:

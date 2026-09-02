@@ -84,9 +84,10 @@ export const rankCandidates = async (jobDescription, query = null, topK = 5) => 
  * @param {Array} chatHistory - Previous chat history
  * @returns {Promise} - Chat response
  */
-export const sendChatMessage = async (message, chatHistory = []) => {
+export const sendChatMessage = async (message, sessionId, chatHistory = []) => {
   const response = await api.post('/chat', {
     message,
+    session_id: sessionId,
     chat_history: chatHistory,
   });
 
