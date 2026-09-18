@@ -3,34 +3,83 @@
 import logging
 import os
 import uuid
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+import asyncio
+import hashlib
+from pathlib import Path
+from typing import BinaryIO
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Response
 from app.dependencies import (
     get_resume_parser_service,
     get_chunking_service,
     get_vector_store_service,
     get_settings
 )
-from app.services.resume_parser import ResumeParserService
-from app.services.chunking_service import ChunkingService
 from app.services.vector_store_service import VectorStoreService
 from app.config import Settings
 from app.models.response_models import ResumeUploadResponse, ResumeMetadata
-from app.utils.file_utils import (
-    ensure_directory_exists,
-    sanitize_filename,
-    extract_candidate_name_from_filename
+from app.utils.file_utils import sanitize_filename, extract_candidate_name_from_filename
+from app.jobs.ingestion_queue import IngestionJobStore, get_arq_pool
+from app.jobs.resume_ingestion import (
+    local_ingestion_lock,
+    process_resume_ingestion,
+    release_local_ingestion_lock,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+class UploadSizeExceeded(ValueError):
+    """Raised when a streamed upload exceeds the configured byte limit."""
+
+
+def _copy_upload_sync(source: BinaryIO, destination: str, max_size: int) -> tuple[str, int]:
+    """Stream an upload to disk and calculate its hash in one thread."""
+    digest = hashlib.sha256()
+    total = 0
+    target = Path(destination)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with target.open("wb") as output:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_size:
+                    raise UploadSizeExceeded(f"File exceeds the {max_size} byte upload limit")
+                digest.update(chunk)
+                output.write(chunk)
+    except Exception:
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return digest.hexdigest(), total
+
+
+async def _persist_upload(file: UploadFile, settings: Settings) -> tuple[str, str, int]:
+    data_dir = Path(settings.upload_data_directory)
+    temp_path = data_dir / f".{uuid.uuid4().hex}.upload"
+    file_hash, size = await asyncio.to_thread(
+        _copy_upload_sync,
+        file.file,
+        str(temp_path),
+        settings.max_upload_size,
+    )
+    canonical_path = data_dir / f"{file_hash}.pdf"
+    if await asyncio.to_thread(canonical_path.exists):
+        await asyncio.to_thread(temp_path.unlink, True)
+    else:
+        await asyncio.to_thread(os.replace, str(temp_path), str(canonical_path))
+    return str(canonical_path.resolve()), file_hash, size
+
+
 @router.post("/upload-resume", response_model=ResumeUploadResponse)
 async def upload_resume(
+    response: Response,
     file: UploadFile = File(...),
-    resume_parser: ResumeParserService = Depends(get_resume_parser_service),
-    chunking_service: ChunkingService = Depends(get_chunking_service),
-    vector_store: VectorStoreService = Depends(get_vector_store_service),
     settings: Settings = Depends(get_settings)
 ):
     """Upload and process a resume PDF file.
@@ -46,102 +95,150 @@ async def upload_resume(
         Upload response with metadata
     """
     try:
-        # Validate file type
-        if not file.filename.endswith('.pdf'):
+        if not file.filename or not file.filename.lower().endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-        
-        # Sanitize filename
-        original_filename = file.filename
-        safe_filename = sanitize_filename(original_filename)
-        
-        # Create data directory if it doesn't exist
-        data_dir = "data/resumes"
-        ensure_directory_exists(data_dir)
-        
-        # Save uploaded file temporarily
-        file_path = os.path.join(data_dir, safe_filename)
-        
-        with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
-        
-        logger.info(f"Saved uploaded file: {safe_filename}")
-        
-        # Parse PDF
-        resume_text = await resume_parser.parse_pdf(file_path)
-        
-        if not resume_text or len(resume_text) < 50:
-            raise HTTPException(status_code=400, detail="Could not extract meaningful text from PDF")
-        
-        # Extract candidate name from filename
+
+        safe_filename = sanitize_filename(file.filename)
+        file_path, file_hash, _ = await _persist_upload(file, settings)
         candidate_name = extract_candidate_name_from_filename(safe_filename)
-        
-        # Extract skills and years of experience using LLM
-        logger.info("Extracting metadata using LLM...")
-        extracted_metadata = await resume_parser.extract_metadata_with_llm(resume_text)
-        skills = extracted_metadata.get("skills", [])
-        years_experience = extracted_metadata.get("years_experience")
-        
-        logger.info(f"Extracted {len(skills)} skills and {years_experience} years of experience")
-        
-        # Chunk the resume text
-        chunks = await chunking_service.chunk_text(resume_text)
-        
-        # Prepare metadata and IDs for each chunk
-        chunk_ids = []
-        chunk_metadatas = []
-        
-        for i, chunk in enumerate(chunks):
-            chunk_id = f"{safe_filename}_{uuid.uuid4().hex[:8]}_{i}"
-            chunk_ids.append(chunk_id)
-            
-            metadata = {
-                "file_name": safe_filename,
-                "candidate_name": candidate_name,
-                "chunk_index": i,
-                "total_chunks": len(chunks)
-            }
-            
-            # Add skills only if the list is not empty (ChromaDB doesn't allow empty lists)
-            if skills and len(skills) > 0:
-                metadata["skills"] = skills
-            
-            # Add years_experience only if it has a value
-            if years_experience is not None:
-                metadata["years_experience"] = years_experience
-            
-            chunk_metadatas.append(metadata)
-        
-        # Add to vector store
-        await vector_store.add_documents(
-            texts=chunks,
-            metadatas=chunk_metadatas,
-            ids=chunk_ids
-        )
-        
-        logger.info(f"Successfully indexed resume: {safe_filename}")
-        
-        # Prepare response with extracted metadata
-        resume_metadata = ResumeMetadata(
-            candidate_name=candidate_name,
-            skills=skills if skills else [],
-            years_experience=years_experience,
-            file_name=safe_filename
-        )
-        
+
+        if settings.ingestion_queue_enabled:
+            if not settings.redis_url:
+                raise HTTPException(status_code=503, detail="Ingestion queue is enabled but REDIS_URL is missing")
+            try:
+                redis = await get_arq_pool(settings.redis_url)
+            except Exception as exc:
+                logger.error("Unable to connect to ingestion queue: %s", exc)
+                raise HTTPException(status_code=503, detail="Ingestion queue is unavailable") from exc
+
+            store = IngestionJobStore(redis, ttl_seconds=settings.ingestion_job_ttl_seconds)
+            job, created = await store.create_or_get(
+                file_hash,
+                file_hash=file_hash,
+                file_path=file_path,
+                file_name=safe_filename,
+            )
+            effective_filename = str(job.get("file_name") or safe_filename)
+            effective_candidate_name = extract_candidate_name_from_filename(effective_filename)
+            status = str(job.get("status", "queued"))
+            if status == "indexed" and isinstance(job.get("result"), dict):
+                completed = job["result"]
+                return ResumeUploadResponse(
+                    success=True,
+                    message="Resume was already indexed",
+                    file_name=completed.get("file_name", effective_filename),
+                    chunks_created=int(completed.get("chunks_created", 0) or 0),
+                    metadata=ResumeMetadata(**completed.get("metadata", {
+                        "candidate_name": effective_candidate_name,
+                        "skills": [],
+                        "years_experience": None,
+                        "file_name": effective_filename,
+                    })),
+                    job_id=file_hash,
+                    status="indexed",
+                )
+            should_enqueue = created or status == "failed" or (
+                status == "queued" and not job.get("enqueued_at")
+            )
+            if should_enqueue:
+                task_id = f"{file_hash}:attempt:{uuid.uuid4().hex}"
+                await redis.enqueue_job(
+                    "ingest_resume",
+                    file_hash,
+                    _job_id=task_id,
+                    _queue_name=settings.ingestion_queue_name,
+                )
+                await store.update(
+                    file_hash,
+                    status="queued",
+                    stage=job.get("stage", "queued"),
+                    enqueued_at=str(asyncio.get_running_loop().time()),
+                    error="",
+                )
+                # The old value can be "failed" when this is a retry. Return
+                # the new state so the frontend polls the job instead of
+                # incorrectly showing the synchronous "indexed" message.
+                status = "queued"
+
+            if response is not None:
+                response.status_code = 202
+
+            return ResumeUploadResponse(
+                success=True,
+                message="Resume accepted and queued for indexing",
+                file_name=effective_filename,
+                chunks_created=int(job.get("chunks_created", 0) or 0),
+                metadata=ResumeMetadata(
+                    candidate_name=effective_candidate_name,
+                    skills=[],
+                    years_experience=None,
+                    file_name=effective_filename,
+                ),
+                job_id=file_hash,
+                status=status,
+            )
+
+        # Local fallback retains the existing synchronous response contract.
+        # PDF/Chunk/Chroma disk work is moved to worker threads by services.
+        resume_parser = get_resume_parser_service()
+        chunking_service = get_chunking_service()
+        vector_store = get_vector_store_service()
+        local_lock = await local_ingestion_lock(file_hash)
+        try:
+            async with local_lock:
+                result = await process_resume_ingestion(
+                    job_id=file_hash,
+                    file_path=file_path,
+                    file_hash=file_hash,
+                    safe_filename=safe_filename,
+                    settings=settings,
+                    resume_parser=resume_parser,
+                    chunking_service=chunking_service,
+                    vector_store=vector_store,
+                )
+        finally:
+            await release_local_ingestion_lock(file_hash, local_lock)
         return ResumeUploadResponse(
             success=True,
-            message=f"Resume uploaded and indexed successfully",
+            message="Resume uploaded and indexed successfully",
             file_name=safe_filename,
-            chunks_created=len(chunks),
-            metadata=resume_metadata
+            chunks_created=result["chunks_created"],
+            metadata=ResumeMetadata(**result["metadata"]),
+            job_id=file_hash,
+            status="indexed",
         )
         
     except HTTPException:
         raise
+    except UploadSizeExceeded as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         logger.error(f"Error uploading resume: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to upload resume: {str(e)}")
+
+
+@router.get("/upload-jobs/{job_id}")
+async def get_upload_job(
+    job_id: str,
+    settings: Settings = Depends(get_settings),
+):
+    """Return queued resume ingestion status and the completed result."""
+    if not settings.ingestion_queue_enabled or not settings.redis_url:
+        raise HTTPException(status_code=404, detail="Ingestion queue is not enabled")
+    try:
+        redis = await get_arq_pool(settings.redis_url)
+        job = await IngestionJobStore(
+            redis,
+            ttl_seconds=settings.ingestion_job_ttl_seconds,
+        ).get(job_id)
+    except Exception as exc:
+        logger.error("Unable to read ingestion job %s: %s", job_id, exc)
+        raise HTTPException(status_code=503, detail="Ingestion queue is unavailable") from exc
+    if not job:
+        raise HTTPException(status_code=404, detail="Ingestion job not found")
+    return job
 
 
 @router.get("/resumes/count")
@@ -154,7 +251,7 @@ async def get_resume_count(
         Total count of documents in vector store
     """
     try:
-        count = vector_store.get_collection_count()
+        count = await vector_store.get_collection_count_async()
         return {"total_documents": count}
     except Exception as e:
         logger.error(f"Error getting resume count: {str(e)}")
@@ -171,7 +268,7 @@ async def list_resumes(
         List of unique resume filenames with metadata
     """
     try:
-        all_metadata = vector_store.get_all_metadata()
+        all_metadata = await vector_store.get_all_metadata_async()
         
         # Group by filename to get unique resumes
         unique_resumes = {}

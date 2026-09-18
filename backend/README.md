@@ -174,7 +174,41 @@ CHUNK_SIZE=500
 CHUNK_OVERLAP=50
 TOP_K_RESULTS=5
 CHROMA_PERSIST_DIRECTORY=./chroma_db
+# Context safeguards (token estimates; no summarization LLM call)
+CONTEXT_WINDOW_TOKENS=32768
+CONTEXT_OUTPUT_RESERVE_TOKENS=2000
+MAX_USER_MESSAGE_TOKENS=8000
+SHORT_TERM_MAX_MESSAGES=20
+INGESTION_QUEUE_ENABLED=true
+REDIS_URL=redis://localhost:6379/0
+INGESTION_WORKER_MAX_JOBS=4
+INGESTION_EMBEDDING_CONCURRENCY=4
+INGESTION_EMBEDDING_BATCH_SIZE=16
+EMBEDDING_TIMEOUT_SECONDS=60
+EMBEDDING_MAX_RETRIES=5
+EMBEDDING_RETRY_MIN_SECONDS=1
+EMBEDDING_RETRY_MAX_SECONDS=20
+SYNC_THREAD_POOL_WORKERS=8
 ```
+
+### Durable resume ingestion
+
+When `INGESTION_QUEUE_ENABLED=true`, `POST /api/upload-resume` only streams
+the file to `UPLOAD_DATA_DIRECTORY`, creates an idempotent job keyed by the
+SHA-256 file hash, and returns `job_id` with status `queued`. Start the ARQ
+worker from the `backend` directory:
+
+```bash
+python -m arq app.jobs.worker.WorkerSettings
+```
+
+Poll `GET /api/upload-jobs/{job_id}` for `queued`, `processing`, `indexed`, or
+`failed`. The worker persists parsed text, metadata, chunks, and embeddings
+before advancing stages. Chroma IDs use `{file_hash}:{chunk_index}` and are
+upserted, so retries resume safely instead of duplicating vectors. API and
+worker processes must share `UPLOAD_DATA_DIRECTORY`, `CHROMA_PERSIST_DIRECTORY`
+and `INGESTION_ARTIFACT_DIRECTORY` (or replace local storage with S3/MinIO and
+an external vector database in a multi-host deployment).
 
 ## License
 

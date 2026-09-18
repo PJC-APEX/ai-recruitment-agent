@@ -1,10 +1,13 @@
 """Main FastAPI application entry point."""
 
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
-from app.api import routes_resume, routes_query, routes_scoring
+from app.api import routes_resume, routes_query, routes_scoring, routes_memory
+from app.jobs.ingestion_queue import close_arq_pool
 
 # Configure logging
 logging.basicConfig(
@@ -53,11 +56,14 @@ async def health_check():
 app.include_router(routes_resume.router, prefix="/api", tags=["Resume"])
 app.include_router(routes_query.router, prefix="/api", tags=["Query"])
 app.include_router(routes_scoring.router, prefix="/api", tags=["Scoring"])
+app.include_router(routes_memory.router, prefix="/api", tags=["Memory"])
 
 
 @app.on_event("startup")
 async def startup_event():
     """Application startup event."""
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=max(1, settings.sync_thread_pool_workers)))
     logger.info(f"Starting {settings.app_name} v{settings.app_version}")
     logger.info("Initializing vector store...")
     # Vector store will be initialized lazily on first use
@@ -66,6 +72,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Application shutdown event."""
+    await close_arq_pool()
     logger.info("Shutting down application...")
 
 

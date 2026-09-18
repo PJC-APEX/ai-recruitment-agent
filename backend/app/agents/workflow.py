@@ -27,7 +27,12 @@ def create_recruitment_workflow(
     llm,
     tools_dict: Dict[str, Any],
     verbose: bool = False,
-    checkpointer=None
+    checkpointer=None,
+    memory_service=None,
+    memory_top_k: int = 5,
+    memory_min_confidence: float = 0.7,
+    context_window_tokens: int = 32768,
+    context_output_reserve_tokens: int = 2000,
 ) -> StateGraph:
     """Create the LangGraph workflow for recruitment agent.
     
@@ -53,18 +58,30 @@ def create_recruitment_workflow(
     logger.info("Creating LangGraph recruitment workflow")
     
     # Initialize nodes with dependencies
-    nodes = GraphNodes(llm=llm, tools_dict=tools_dict, verbose=verbose)
+    nodes = GraphNodes(
+        llm=llm,
+        tools_dict=tools_dict,
+        verbose=verbose,
+        memory_service=memory_service,
+        memory_top_k=memory_top_k,
+        memory_min_confidence=memory_min_confidence,
+        context_window_tokens=context_window_tokens,
+        context_output_reserve_tokens=context_output_reserve_tokens,
+    )
     
     # Create the graph
     workflow = StateGraph(AgentState)
     
     # Add nodes to the graph
     workflow.add_node("reasoning", nodes.reasoning_node)
+    workflow.add_node("memory_retrieval", nodes.memory_retrieval_node)
     workflow.add_node("tool_execution", nodes.tool_execution_node)
     workflow.add_node("response_generation", nodes.response_generation_node)
+    workflow.add_node("memory_extraction", nodes.memory_extraction_node)
     
     # Set entry point
-    workflow.set_entry_point("reasoning")
+    workflow.set_entry_point("memory_retrieval")
+    workflow.add_edge("memory_retrieval", "reasoning")
     
     # Add conditional edges from reasoning node
     workflow.add_conditional_edges(
@@ -82,12 +99,14 @@ def create_recruitment_workflow(
         should_continue_loop,
         {
             "continue": "reasoning",
+            "respond": "response_generation",
             "end": END
         }
     )
     
     # Response generation ends the workflow
-    workflow.add_edge("response_generation", END)
+    workflow.add_edge("response_generation", "memory_extraction")
+    workflow.add_edge("memory_extraction", END)
     
     # Compile the graph
     compiled_workflow = workflow.compile(checkpointer=checkpointer)

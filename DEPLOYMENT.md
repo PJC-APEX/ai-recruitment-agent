@@ -349,6 +349,18 @@ def cached_search(query):
 
 4. **Async Workers**: Celery for background tasks
 
+For resume ingestion, this project now supports an ARQ + Redis worker. Set
+`INGESTION_QUEUE_ENABLED=true` and `REDIS_URL`, then run from `backend`:
+
+```bash
+python -m arq app.jobs.worker.WorkerSettings
+```
+
+`POST /api/upload-resume` returns a content-hash `job_id` with `queued` status;
+poll `GET /api/upload-jobs/{job_id}`. Parsing/chunking/local Chroma I/O use the
+bounded thread pool, Embedding calls use a semaphore, and retries use stable
+`{file_hash}:{chunk_index}` vector IDs plus Redis locks.
+
 ### Frontend
 
 1. **CDN**: Serve static files from CDN

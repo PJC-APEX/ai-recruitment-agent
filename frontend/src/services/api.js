@@ -31,6 +31,12 @@ export const uploadResume = async (file) => {
   return response.data;
 };
 
+/** Poll durable resume ingestion status by job id. */
+export const getUploadJob = async (jobId) => {
+  const response = await api.get(`/upload-jobs/${jobId}`);
+  return response.data;
+};
+
 /**
  * Search for resumes matching a query
  * @param {string} query - Natural language query

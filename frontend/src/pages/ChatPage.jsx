@@ -2,7 +2,7 @@ import { useState } from 'react';
 import CandidateCard from '../components/CandidateCard';
 import ChatBox from '../components/ChatBox';
 import ResumeUpload from '../components/ResumeUpload';
-import { sendChatMessage, uploadResume } from '../services/api';
+import { sendChatMessage, uploadResume, getUploadJob } from '../services/api';
 
 /**
  * ChatPage - Main page with chat interface and resume upload
@@ -84,7 +84,34 @@ const ChatPage = () => {
     try {
       const response = await uploadResume(file);
 
-      // Add success message to chat
+      if (response.status === 'queued' && response.job_id) {
+        setMessages((prev) => [...prev, {
+          text: `✓ ${response.file_name} 已接收，正在后台解析和索引（任务 ${response.job_id.slice(0, 12)}…）`,
+          isUser: false,
+          timestamp: new Date().toISOString(),
+        }]);
+
+        // Keep the existing UI simple while exposing the durable job state.
+        // Stop polling on completion/failure or after one minute.
+        for (let attempt = 0; attempt < 60; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          const job = await getUploadJob(response.job_id);
+          if (job.status === 'indexed') {
+            setMessages((prev) => [...prev, {
+              text: `✓ ${response.file_name} 已完成索引，共 ${job.chunks_created || 0} 个分块。`,
+              isUser: false,
+              timestamp: new Date().toISOString(),
+            }]);
+            break;
+          }
+          if (job.status === 'failed') {
+            throw new Error(`后台索引失败：${job.error || 'Resume ingestion failed'}`);
+          }
+        }
+        return;
+      }
+
+      // Synchronous/local fallback response
       const successMessage = {
         text: `✓ Successfully uploaded ${response.file_name}\n${response.chunks_created} chunks created and indexed.`,
         isUser: false,
@@ -93,7 +120,8 @@ const ChatPage = () => {
 
       setMessages((prev) => [...prev, successMessage]);
     } catch (error) {
-      throw new Error(error.response?.data?.detail || 'Upload failed');
+      const detail = error.response?.data?.detail || error.message || 'Upload failed';
+      throw new Error(detail);
     } finally {
       setIsUploading(false);
     }

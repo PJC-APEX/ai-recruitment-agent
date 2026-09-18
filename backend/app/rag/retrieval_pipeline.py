@@ -100,7 +100,7 @@ class RetrievalPipeline:
         """
         try:
             # Get all metadata from vector store
-            all_metadata = self.vector_store.get_all_metadata()
+            all_metadata = await self.vector_store.get_all_metadata_async()
             
             # Group by file_name to get unique candidates
             candidates_map = {}
@@ -141,11 +141,11 @@ class RetrievalPipeline:
             Resume text if found, None otherwise
         """
         try:
-            # Search with filename filter
-            results = await self.vector_store.search(
-                query="",  # Empty query to get all chunks
-                top_k=100,  # Get many chunks
-                filter_metadata={"file_name": file_name}
+            # File-name lookup is an exact metadata query. It must not call
+            # the embedding service with an empty query string.
+            results = await self.vector_store.get_by_metadata_async(
+                filter_metadata={"file_name": file_name},
+                limit=100,
             )
             
             if not results["documents"]:

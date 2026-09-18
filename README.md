@@ -320,6 +320,18 @@ docker-compose up -d
 5. Display in Chat UI ← Show Candidate Cards
 ```
 
+## Recent Improvements
+
+- Persistent short-term conversation state through LangGraph checkpoints
+- Long-term user memory stored in SQLite and ChromaDB
+- Token-aware context windows with deterministic key-fact retention
+- Tool-loop protection: iteration limits, duplicate-call detection, per-tool limits, and timeouts
+- Redis + ARQ resumable resume ingestion: PDF parsing, metadata extraction, chunking, Embedding, and vector upsert run as a background job
+- SHA-256 job idempotency, deterministic vector IDs, stage checkpoints, and retry-safe Chroma upserts
+- Bounded thread-pool file/Chroma/SQLite work and Embedding concurrency controls
+
+For the Redis/ARQ ingestion setup, see [backend/README.md](backend/README.md) and [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## 🤝 Contributing
 
 Contributions welcome! Please follow:

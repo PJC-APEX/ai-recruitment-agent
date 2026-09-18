@@ -19,6 +19,10 @@ class ResumeUploadResponse(BaseModel):
     file_name: str
     chunks_created: int
     metadata: ResumeMetadata
+    # Present for queued ingestion; retained as optional fields for backwards
+    # compatibility with the synchronous response shape.
+    job_id: Optional[str] = None
+    status: str = "indexed"
 
 
 class CandidateResult(BaseModel):

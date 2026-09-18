@@ -27,6 +27,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.tools import Tool
 
 from app.agents.graph_state import AgentState, create_initial_state
+from app.agents.context_manager import count_tokens, fit_history, merge_key_facts
 from app.agents.workflow import create_recruitment_workflow
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,13 @@ class RecruitmentAgent:
         verbose: bool = False,
         checkpointer=None,
         checkpoint_db_path: Optional[str] = None,
-        max_short_term_messages: int = 20
+        max_short_term_messages: int = 20,
+        context_window_tokens: int = 32768,
+        context_output_reserve_tokens: int = 2000,
+        max_user_message_tokens: int = 8000,
+        memory_service=None,
+        memory_top_k: int = 5,
+        memory_min_confidence: float = 0.7
     ):
         """Initialize the recruitment agent with LangGraph workflow.
         
@@ -70,6 +77,9 @@ class RecruitmentAgent:
             tools: List of LangChain tools available to the agent
             max_iterations: Maximum number of workflow iterations
             verbose: Whether to log detailed workflow steps
+            context_window_tokens: Maximum estimated input context size
+            context_output_reserve_tokens: Tokens reserved for model output
+            max_user_message_tokens: Hard limit for one user turn
         """
         self.llm_client = llm_client
         self.tools = tools
@@ -77,8 +87,14 @@ class RecruitmentAgent:
         self.max_iterations = max_iterations
         self.verbose = verbose
         self.max_short_term_messages = max_short_term_messages
+        self.context_window_tokens = context_window_tokens
+        self.context_output_reserve_tokens = context_output_reserve_tokens
+        self.max_user_message_tokens = max_user_message_tokens
         self.checkpointer = checkpointer
         self.checkpoint_db_path = checkpoint_db_path
+        self.memory_service = memory_service
+        self.memory_top_k = memory_top_k
+        self.memory_min_confidence = memory_min_confidence
         self._checkpoint_lock = asyncio.Lock()
         self.logger = logger
         
@@ -88,7 +104,10 @@ class RecruitmentAgent:
         # Create the LangGraph workflow
         self.workflow = create_recruitment_workflow(
             llm=self.llm, tools_dict=self.tools_dict, verbose=verbose,
-            checkpointer=checkpointer
+            checkpointer=checkpointer, memory_service=memory_service,
+            memory_top_k=memory_top_k, memory_min_confidence=memory_min_confidence,
+            context_window_tokens=context_window_tokens,
+            context_output_reserve_tokens=context_output_reserve_tokens,
         ) if checkpointer is not None or not checkpoint_db_path else None
         
         self.logger.info(f"Initialized RecruitmentAgent with LangGraph workflow and {len(tools)} tools")
@@ -111,7 +130,8 @@ class RecruitmentAgent:
         self,
         query: str,
         chat_history: Optional[List[tuple[str, str]]] = None,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Process a user query using the LangGraph workflow.
         
@@ -123,12 +143,22 @@ class RecruitmentAgent:
         Args:
             query: User's natural language query
             chat_history: Optional conversation history as list of (role, content) tuples
+            session_id: Stable id used to restore checkpointed short-term context
+            user_id: Optional id used for long-term memory retrieval
             
         Returns:
             Dict with 'response', 'tools_used', and 'success' keys
         """
         try:
             self.logger.info(f"Agent processing query with LangGraph: {query}")
+
+            query_tokens = self._count_tokens(query)
+            if query_tokens > self.max_user_message_tokens:
+                message = (
+                    f"Your message is too long (about {query_tokens} tokens). "
+                    f"Please shorten it to at most {self.max_user_message_tokens} tokens and try again."
+                )
+                return {"response": message, "tools_used": [], "success": False, "error": "user_message_too_long"}
 
             # AsyncSqliteSaver must be created inside a running event loop.
             if self.workflow is None and self.checkpoint_db_path:
@@ -143,7 +173,12 @@ class RecruitmentAgent:
                         await self.checkpointer.setup()
                         self.workflow = create_recruitment_workflow(
                             llm=self.llm, tools_dict=self.tools_dict,
-                            verbose=self.verbose, checkpointer=self.checkpointer
+                            verbose=self.verbose, checkpointer=self.checkpointer,
+                            memory_service=self.memory_service,
+                            memory_top_k=self.memory_top_k,
+                            memory_min_confidence=self.memory_min_confidence,
+                            context_window_tokens=self.context_window_tokens,
+                            context_output_reserve_tokens=self.context_output_reserve_tokens,
                         )
             
             # A caller-provided session id enables persistent checkpoints. If
@@ -158,16 +193,28 @@ class RecruitmentAgent:
             # supplied by older clients.
             previous_state = await self.workflow.aget_state(config) if self.checkpointer is not None else None
             persisted_history = previous_state.values.get("chat_history", []) if previous_state else []
+            persisted_facts = previous_state.values.get("context_facts", []) if previous_state else []
             base_history = persisted_history or (chat_history or [])
             # The current user turn is part of the context seen by every node.
-            merged_history = [*base_history, ("human", query)]
-            merged_history = merged_history[-self.max_short_term_messages:]
+            merged_history = self._fit_history(base_history, query)
+            user_fact_sources = []
+            for item in base_history:
+                if not isinstance(item, (tuple, list)) or len(item) != 2:
+                    continue
+                role, content = item
+                if str(role).lower() in {"human", "user"}:
+                    user_fact_sources.append(str(content or ""))
+            user_fact_sources.append(query)
+            context_facts = merge_key_facts(persisted_facts, user_fact_sources)
 
             initial_state = create_initial_state(
                 user_question=query,
                 chat_history=merged_history,
                 max_iterations=self.max_iterations
             )
+            initial_state["user_id"] = user_id
+            initial_state["session_id"] = session_id
+            initial_state["context_facts"] = context_facts
             
             if self.verbose:
                 self.logger.info("[Agent] Starting LangGraph workflow execution")
@@ -183,13 +230,25 @@ class RecruitmentAgent:
             # Checkpointing stores node outputs. Persist the assistant turn as
             # part of chat_history so the next request can restore it.
             if final_answer and error is None and self.checkpointer is not None:
-                updated_history = [
+                history_to_persist = [
                     *final_state.get("chat_history", merged_history),
                     ("ai", final_answer),
-                ][-self.max_short_term_messages:]
+                ]
+                updated_history = fit_history(
+                    history_to_persist,
+                    "",
+                    max_messages=self.max_short_term_messages,
+                    context_window_tokens=self.context_window_tokens,
+                    output_reserve_tokens=self.context_output_reserve_tokens,
+                    include_query=False,
+                )
+                updated_facts = final_state.get("context_facts", context_facts)
                 # Update the persisted thread with the assistant turn. This
                 # creates a new checkpoint without rerunning the workflow.
-                await self.workflow.aupdate_state(config, {"chat_history": updated_history})
+                await self.workflow.aupdate_state(
+                    config,
+                    {"chat_history": updated_history, "context_facts": updated_facts},
+                )
             
             if self.verbose:
                 self.logger.info(f"[Agent] Workflow completed. Tools used: {tools_used}")
@@ -219,6 +278,44 @@ class RecruitmentAgent:
                 "success": False,
                 "error": str(e)
             }
+
+    def _count_tokens(self, text: str) -> int:
+        """Count tokens using a conservative OpenAI-compatible encoding.
+
+        The configured chat provider may use a different tokenizer, so this
+        count is intentionally treated as an upper-bound estimate for deciding
+        whether a request is safe to send.
+        """
+        return count_tokens(text)
+
+    def _fit_history(
+        self,
+        history: List[tuple[str, str]],
+        query: str,
+    ) -> List[tuple[str, str]]:
+        """Apply message-count and token-based sliding-window limits.
+
+        The newest messages are retained first. Older messages are dropped
+        deterministically; no summarization LLM call is made. A conservative
+        allowance is reserved for system instructions, long-term memories,
+        tool schemas/results, and message framing assembled by graph nodes.
+        The current user turn is always retained (and is still represented in
+        ``chat_history`` for checkpoint compatibility with the existing flow).
+        """
+        selected = fit_history(
+            history,
+            query,
+            max_messages=self.max_short_term_messages,
+            context_window_tokens=self.context_window_tokens,
+            output_reserve_tokens=self.context_output_reserve_tokens,
+        )
+        if self.verbose and len(selected) < len(history or []) + 1:
+            self.logger.info(
+                "[Context] Applied message/token sliding window: %d -> %d messages",
+                len(history or []) + 1,
+                len(selected),
+            )
+        return selected
     
     def add_tool(self, tool: Tool) -> None:
         """Add a new tool to the agent (following Open/Closed Principle).

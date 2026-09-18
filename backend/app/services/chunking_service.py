@@ -1,6 +1,7 @@
 """Chunking service using LangChain RecursiveCharacterTextSplitter."""
 
 import logging
+import asyncio
 from typing import List
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -36,6 +37,10 @@ class ChunkingService:
         Returns:
             List of text chunks
         """
+        return await asyncio.to_thread(self.chunk_text_sync, text)
+
+    def chunk_text_sync(self, text: str) -> List[str]:
+        """Synchronous splitter implementation executed in a worker thread."""
         try:
             chunks = self.text_splitter.split_text(text)
             self.logger.info(f"Created {len(chunks)} chunks from text")

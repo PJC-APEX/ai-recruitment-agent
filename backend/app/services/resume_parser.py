@@ -1,6 +1,7 @@
 """Resume parser service using PyPDF."""
 
 import logging
+import asyncio
 from typing import Optional, Dict, Any, List
 from pypdf import PdfReader
 import re
@@ -32,22 +33,26 @@ class ResumeParserService:
         Raises:
             Exception: If parsing fails
         """
+        return await asyncio.to_thread(self.parse_pdf_sync, file_path)
+
+    def parse_pdf_sync(self, file_path: str) -> str:
+        """Synchronous parser implementation executed in a worker thread."""
         try:
             reader = PdfReader(file_path)
             text_content = []
-            
+
             for page_num, page in enumerate(reader.pages, 1):
                 text = page.extract_text()
                 if text:
                     text_content.append(text)
                     self.logger.debug(f"Extracted text from page {page_num}")
-            
+
             full_text = "\n\n".join(text_content)
             cleaned_text = self._clean_text(full_text)
-            
+
             self.logger.info(f"Successfully parsed PDF: {file_path}")
             return cleaned_text
-            
+
         except Exception as e:
             self.logger.error(f"Error parsing PDF {file_path}: {str(e)}")
             raise Exception(f"Failed to parse PDF: {str(e)}")
@@ -106,7 +111,7 @@ class ResumeParserService:
         """
         if not self.llm_client:
             self.logger.warning("LLM client not available, returning empty metadata")
-            return {"skills": [], "years_experience": None}
+            return {"skills": [], "years_experience": None, "_extraction_succeeded": False}
         
         try:
             from app.llm.prompt_templates import RESUME_EXTRACTION_PROMPT
@@ -143,9 +148,14 @@ class ResumeParserService:
             
             return {
                 "skills": skills,
-                "years_experience": years_exp
+                "years_experience": years_exp,
+                "_extraction_succeeded": True,
             }
             
         except Exception as e:
             self.logger.error(f"Error extracting metadata with LLM: {str(e)}")
-            return {"skills": [], "years_experience": None}
+            return {
+                "skills": [],
+                "years_experience": None,
+                "_extraction_succeeded": False,
+            }

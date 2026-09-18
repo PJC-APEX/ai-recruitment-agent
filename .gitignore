@@ -47,7 +47,11 @@ chroma_db/
 logs/
 
 # Data
+backend/data/
 data/resumes/*.pdf
+backend/data/resumes/*.pdf
+backend/data/ingestion/
+backend/data/memories.sqlite*
 data/uploads/
 
 # Node

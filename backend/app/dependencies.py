@@ -7,6 +7,7 @@ from app.services.embedding_service import EmbeddingService
 from app.services.resume_parser import ResumeParserService
 from app.services.chunking_service import ChunkingService
 from app.services.ranking_service import RankingService
+from app.services.memory_service import MemoryService
 from app.llm.llm_client import LLMClient
 from app.rag.retrieval_pipeline import RetrievalPipeline
 from app.rag.scoring_pipeline import ScoringPipeline
@@ -40,7 +41,12 @@ def get_embedding_service() -> EmbeddingService:
         api_key=settings.embedding_api_key or settings.azure_openai_api_key,
         endpoint=settings.embedding_base_url or settings.azure_openai_endpoint,
         model=settings.azure_openai_embedding_model,
-        api_version=settings.azure_openai_api_version
+        api_version=settings.azure_openai_api_version,
+        max_concurrency=settings.ingestion_embedding_concurrency,
+        timeout_seconds=settings.embedding_timeout_seconds,
+        max_retries=settings.embedding_max_retries,
+        retry_min_seconds=settings.embedding_retry_min_seconds,
+        retry_max_seconds=settings.embedding_retry_max_seconds,
     )
 
 
@@ -96,6 +102,11 @@ def get_scoring_pipeline() -> ScoringPipeline:
     llm_client = get_llm_client()
     return ScoringPipeline(llm_client=llm_client)
 
+@lru_cache()
+def get_memory_service() -> MemoryService:
+    settings = get_settings()
+    return MemoryService(settings.memory_sqlite_path, get_embedding_service(), settings.memory_collection_name)
+
 
 def get_checkpoint_db_path() -> str:
     """Return the configured checkpoint database path."""
@@ -114,6 +125,7 @@ def get_recruitment_agent() -> RecruitmentAgent:
     llm_client = get_llm_client()
     retrieval_pipeline = get_retrieval_pipeline()
     settings = get_settings()
+    memory_service = get_memory_service() if settings.memory_enabled else None
     
     # Create tools (following Open/Closed Principle - easy to add more)
     tools = [
@@ -129,5 +141,11 @@ def get_recruitment_agent() -> RecruitmentAgent:
         max_iterations=15,  # Allow more iterations for complex multi-candidate comparisons
         verbose=settings.debug,  # Show agent reasoning in debug mode
         checkpoint_db_path=get_checkpoint_db_path(),
-        max_short_term_messages=settings.short_term_max_messages
+        max_short_term_messages=settings.short_term_max_messages,
+        context_window_tokens=settings.context_window_tokens,
+        context_output_reserve_tokens=settings.context_output_reserve_tokens,
+        max_user_message_tokens=settings.max_user_message_tokens,
+        memory_service=memory_service,
+        memory_top_k=settings.memory_top_k,
+        memory_min_confidence=settings.memory_min_confidence
     )
