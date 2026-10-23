@@ -1,372 +1,126 @@
-# Resume Screening and Matching System
+# AI 招聘助手
 
-Production-ready AI-powered resume screening system using RAG (Retrieval Augmented Generation).
+这是一个用于简历入库、语义检索、岗位匹配和自然语言招聘问答的全栈项目。后端使用 FastAPI、LangGraph 和 ChromaDB，前端使用 React。LLM 与 Embedding 通过 OpenAI 兼容配置调用，当前示例配置为 Azure OpenAI。
 
-![System Architecture](https://img.shields.io/badge/Stack-FastAPI%20%2B%20React-blue)
-![AI Powered](https://img.shields.io/badge/AI-OpenAI%20%2B%20LangChain-green)
-![Database](https://img.shields.io/badge/Vector%20DB-ChromaDB-orange)
+## 当前能力
 
-## 🎯 Overview
+- 上传 PDF 简历，提取文本、候选人信息并建立向量索引。
+- 用自然语言搜索人才，按岗位描述评分和排序。
+- 通过 LangGraph Agent 对话查询候选人，并读取候选人完整简历。
+- 使用 SQLite 保存会话检查点和长期记忆；长期记忆通过向量检索召回。
+- 可选 Redis/ARQ 简历摄取队列，支持按文件哈希幂等处理、任务状态查询和失败恢复。
+- 可选飞书机器人 webhook 与 Langfuse Agent 观测。
+- 使用 Docker Compose 部署前后端，ChromaDB、简历文件和 SQLite 数据保存在宿主机挂载目录。
 
-A full-stack application that enables recruiters to:
+KEV/Laya 预筛、岗位级通过/待复核/不匹配状态、人工复核队列目前尚未实现。本仓库这一版可作为后续模型初筛功能的开发基线。
 
-- **Upload** resumes (PDF) and automatically index them
-- **Search** for candidates using natural language
-- **Score** resumes against job descriptions
-- **Rank** candidates based on relevance
-- **Chat** with an AI assistant for conversational queries
+## 架构
 
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   Frontend (React)                  │
-│  Chat UI | Resume Upload | Candidate Display       │
-└────────────────────┬────────────────────────────────┘
-                     │ HTTP/REST
-┌────────────────────▼────────────────────────────────┐
-│              Backend (FastAPI)                      │
-│  Routes | Services | RAG Pipeline | LLM Client     │
-└────────────────────┬────────────────────────────────┘
-                     │
-        ┌────────────┼────────────┐
-        │            │            │
-┌───────▼──────┐ ┌──▼──────┐ ┌──▼─────────┐
-│   OpenAI     │ │ ChromaDB │ │   PyPDF    │
-│  Embeddings  │ │  Vector  │ │   Parser   │
-│     LLM      │ │   Store  │ │            │
-└──────────────┘ └──────────┘ └────────────┘
+```mermaid
+flowchart LR
+    U[React 前端] -->|/api| F[FastAPI]
+    F --> P[简历解析与摄取]
+    P --> C[(ChromaDB)]
+    F --> A[LangGraph 招聘 Agent]
+    A --> L[OpenAI 兼容 LLM]
+    A --> M[(SQLite 会话与记忆)]
+    F -. 可选 .-> R[Redis / ARQ]
+    F -. 可选 .-> O[Langfuse]
+    B[飞书] -. 可选 webhook .-> F
 ```
 
-## 📁 Project Structure
+## 本地运行
 
-```
-resume-ai/
-├── backend/                    # FastAPI Backend
-│   ├── app/
-│   │   ├── main.py            # Application entry point
-│   │   ├── config.py          # Configuration
-│   │   ├── dependencies.py    # Dependency injection
-│   │   ├── api/               # API routes
-│   │   │   ├── routes_resume.py
-│   │   │   ├── routes_query.py
-│   │   │   └── routes_scoring.py
-│   │   ├── services/          # Business logic
-│   │   │   ├── resume_parser.py
-│   │   │   ├── chunking_service.py
-│   │   │   ├── embedding_service.py
-│   │   │   ├── vector_store_service.py
-│   │   │   └── ranking_service.py
-│   │   ├── llm/               # LLM integration
-│   │   │   ├── llm_client.py
-│   │   │   └── prompt_templates.py
-│   │   ├── rag/               # RAG pipelines
-│   │   │   ├── retrieval_pipeline.py
-│   │   │   └── scoring_pipeline.py
-│   │   ├── models/            # Pydantic models
-│   │   │   ├── request_models.py
-│   │   │   └── response_models.py
-│   │   └── utils/
-│   │       └── file_utils.py
-│   ├── data/
-│   │   └── resumes/           # Uploaded PDFs
-│   ├── requirements.txt
-│   ├── .env.example
-│   └── README.md
-│
-└── frontend/                   # React Frontend
-    ├── src/
-    │   ├── components/        # React components
-    │   │   ├── ChatBox.jsx
-    │   │   ├── MessageBubble.jsx
-    │   │   ├── ResumeUpload.jsx
-    │   │   └── CandidateCard.jsx
-    │   ├── pages/
-    │   │   └── ChatPage.jsx
-    │   ├── services/
-    │   │   └── api.js         # API client
-    │   ├── App.jsx
-    │   ├── main.jsx
-    │   └── index.css
-    ├── package.json
-    ├── vite.config.js
-    ├── tailwind.config.js
-    └── README.md
-```
+环境要求：Python 3.11、Node.js 20，以及可访问的 Azure OpenAI 或其他兼容服务。
 
-## 🚀 Quick Start
+### 后端
 
-### Prerequisites
+在 PowerShell 中：
 
-- Python 3.9+
-- Node.js 18+
-- OpenAI API Key
-
-### Backend Setup
-
-```bash
-# Navigate to backend
+```powershell
 cd backend
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+Copy-Item .env.example .env
+```
 
-# Configure environment
-cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
+编辑 `backend/.env`，至少填写 `AZURE_OPENAI_ENDPOINT`、`AZURE_OPENAI_API_KEY`、聊天模型和 Embedding 模型。然后启动：
 
-# Run server
+```powershell
 python -m app.main
 ```
 
-Backend will be available at: **http://localhost:8000**
+API 文档：<http://localhost:8000/docs>；健康检查：<http://localhost:8000/health>。
 
-API Docs: **http://localhost:8000/docs**
+### 前端
 
-### Frontend Setup
+另开终端：
 
-```bash
-# Navigate to frontend
+```powershell
 cd frontend
-
-# Install dependencies
-npm install
-
-# Start dev server
+npm ci
 npm run dev
 ```
 
-Frontend will be available at: **http://localhost:5173**
+Vite 开发服务器地址见启动输出。前端默认请求同源 `/api`，本地代理配置见 `frontend/vite.config.js`。
 
-## 🎨 Features
+## Docker Compose
 
-### 1. Resume Upload & Indexing
-
-- Upload PDF resumes via drag-and-drop
-- Automatic text extraction using PyPDF
-- Text chunking (500 chars, 50 overlap)
-- Embedding generation (OpenAI)
-- Vector storage in ChromaDB
-
-### 2. Semantic Search
-
-Natural language queries like:
-
-- "Find Python developers with 5+ years experience"
-- "Who has machine learning and AWS skills?"
-- "Search for senior full-stack engineers"
-
-### 3. Resume Scoring
-
-Score resumes against job descriptions with:
-
-- **Match Score** (0-100)
-- **Matching Skills**
-- **Missing Skills**
-- **Experience Match**
-- **AI Summary**
-
-### 4. Candidate Ranking
-
-Rank multiple candidates for a position:
-
-- Retrieve relevant candidates
-- Score each against job description
-- Return ranked list with analysis
-
-### 5. Chat Interface
-
-ChatGPT-style conversational UI:
-
-- Natural language interaction
-- Real-time candidate display
-- Message history
-- Inline candidate cards
-
-## 🔧 Technology Stack
-
-### Backend
-
-| Technology | Purpose |
-|------------|---------|
-| **FastAPI** | Modern async web framework |
-| **LangChain** | LLM orchestration |
-| **OpenAI API** | Embeddings & LLM |
-| **ChromaDB** | Vector database |
-| **PyPDF** | PDF text extraction |
-| **Pydantic** | Data validation |
-
-### Frontend
-
-| Technology | Purpose |
-|------------|---------|
-| **React 18** | UI framework |
-| **Vite** | Build tool |
-| **TailwindCSS** | Styling |
-| **Axios** | HTTP client |
-| **React Dropzone** | File upload |
-
-## 📡 API Endpoints
-
-### Resume Management
-
-```
-POST   /api/upload-resume      Upload resume PDF
-GET    /api/resumes/count      Get resume count
-GET    /api/resumes/list       List all resumes
-```
-
-### Search & Query
-
-```
-POST   /api/search-resumes     Search with natural language
-POST   /api/rank-candidates    Rank candidates for job
-POST   /api/chat              Chat interface
-```
-
-### Scoring
-
-```
-POST   /api/score-resume       Score resume vs job description
-```
-
-## 💡 Example Usage
-
-### Search Request
+在仓库根目录创建 `backend/.env` 并填写模型服务配置，然后运行：
 
 ```bash
-curl -X POST http://localhost:8000/api/search-resumes \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "Find senior Python developers with FastAPI experience",
-    "top_k": 5
-  }'
+docker compose config --quiet
+docker compose up -d --build
+docker compose ps
+docker compose logs -f backend
 ```
 
-### Score Request
+Compose 默认关闭 Redis 队列，使用同步简历摄取；前端容器绑定到 `127.0.0.1:8080`，适合由服务器现有 Nginx 代理 HTTPS 流量。数据挂载在 `backend/chroma_db` 和 `backend/data`。升级时保留这两个目录，不要执行会删除数据卷或目录的清理操作。
 
-```bash
-curl -X POST http://localhost:8000/api/score-resume \
-  -H "Content-Type: application/json" \
-  -d '{
-    "resume_text": "...",
-    "job_description": "We are looking for a senior Python developer..."
-  }'
-```
+更完整的部署说明见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
-### Upload Request
+## API
 
-```bash
-curl -X POST http://localhost:8000/api/upload-resume \
-  -F "file=@john_doe_resume.pdf"
-```
+主要接口都挂在 `/api` 下：
 
-## ⚙️ Configuration
+| 接口 | 用途 |
+|---|---|
+| `POST /api/upload-resume` | 上传并摄取 PDF 简历 |
+| `GET /api/upload-jobs/{job_id}` | 查询异步摄取状态 |
+| `GET /api/resumes/count`、`GET /api/resumes/list` | 查看人才库 |
+| `POST /api/search-resumes` | 语义检索简历 |
+| `POST /api/score-resume` | 简历与岗位描述评分 |
+| `POST /api/rank-candidates` | 检索并排序候选人 |
+| `POST /api/chat` | 与招聘 Agent 对话 |
+| `/api/memories` | 管理用户长期记忆 |
+| `POST /api/feishu/events` | 可选飞书事件回调 |
 
-### Backend (.env)
+完整请求与响应结构以运行中的 FastAPI 文档为准：`/docs`。
 
-```env
-OPENAI_API_KEY=your_key_here
-CHUNK_SIZE=500
-CHUNK_OVERLAP=50
-TOP_K_RESULTS=5
-CHROMA_PERSIST_DIRECTORY=./chroma_db
-```
+## 测试与评估
 
-### Frontend (src/services/api.js)
-
-```javascript
-const API_BASE_URL = 'http://localhost:8000/api';
-```
-
-## 🧪 Testing
-
-### Backend Tests
-
-```bash
+```powershell
 cd backend
-pytest tests/
+python -m pytest tests -q
 ```
 
-### Frontend Tests
+前端生产构建：
 
-```bash
+```powershell
 cd frontend
-npm test
+npm ci
+npm run build
 ```
 
-## 🐳 Docker Deployment (Optional)
+RAG 对话评估工具和说明位于 `backend/evals/`。样本需由使用者在本机准备，可通过 `--cases` 指向私有 JSONL；评估结果保存在本地并由 `.gitignore` 排除。样本与结果可能包含候选人信息，不应提交到 Git 仓库。
 
-```bash
-# Coming soon
-docker-compose up -d
-```
+## 重要数据与凭证
 
-## 📈 Workflow
+- `backend/.env` 存放密钥，禁止提交。
+- `backend/data/` 保存上传的简历、检查点、记忆和摄取任务文件。
+- `backend/chroma_db/` 保存简历向量索引。
+- 这些目录不属于代码发布产物，部署前后需要单独备份和保护。
+- Langfuse 默认关闭；启用时 `LANGFUSE_CAPTURE_CONTENT=false` 会保留提示词和简历正文脱敏的默认行为。
 
-```
-1. Upload Resume → Parse PDF → Extract Text
-                              ↓
-2. Chunk Text → Generate Embeddings → Store in ChromaDB
-                                              ↓
-3. User Query → Convert to Embedding → Search Vectors
-                                              ↓
-4. Retrieve Matches → Rank with LLM → Return Results
-                                              ↓
-5. Display in Chat UI ← Show Candidate Cards
-```
-
-## Recent Improvements
-
-- Persistent short-term conversation state through LangGraph checkpoints
-- Long-term user memory stored in SQLite and ChromaDB
-- Token-aware context windows with deterministic key-fact retention
-- Tool-loop protection: iteration limits, duplicate-call detection, per-tool limits, and timeouts
-- Redis + ARQ resumable resume ingestion: PDF parsing, metadata extraction, chunking, Embedding, and vector upsert run as a background job
-- SHA-256 job idempotency, deterministic vector IDs, stage checkpoints, and retry-safe Chroma upserts
-- Bounded thread-pool file/Chroma/SQLite work and Embedding concurrency controls
-
-For the Redis/ARQ ingestion setup, see [backend/README.md](backend/README.md) and [DEPLOYMENT.md](DEPLOYMENT.md).
-
-## 🤝 Contributing
-
-Contributions welcome! Please follow:
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push and create a Pull Request
-
-## 📄 License
-
-MIT License - see LICENSE file for details
-
-## 🙋 Support
-
-For issues or questions:
-
-- Open an issue on GitHub
-- Check API documentation at `/docs`
-
-## 🔮 Future Enhancements
-
-- [ ] Multi-language support
-- [ ] Bulk resume upload
-- [ ] Advanced filtering
-- [ ] Resume comparison
-- [ ] Export reports
-- [ ] User authentication
-- [ ] Role-based access
-- [ ] Analytics dashboard
-
-## 🏆 Credits
-
-Built with ❤️ using FastAPI, React, OpenAI, and LangChain.
-
----
-
-**Made for recruiters, powered by AI** 🚀
+当前代码变更基线和已知边界见 [CHANGELOG.md](CHANGELOG.md)。

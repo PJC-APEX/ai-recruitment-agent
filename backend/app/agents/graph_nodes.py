@@ -23,6 +23,7 @@ from app.agents.context_manager import (
     merge_key_facts,
     trim_text_to_tokens,
 )
+from app.agents.resume_context import extract_resume_comparison_fields
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class GraphNodes:
         tool_timeout_seconds: float = 15.0,
         context_window_tokens: int = 32768,
         context_output_reserve_tokens: int = 2000,
+        observability=None,
     ):
         """Initialize graph nodes with dependencies.
         
@@ -72,10 +74,261 @@ class GraphNodes:
         self.tool_timeout_seconds = tool_timeout_seconds
         self.context_window_tokens = context_window_tokens
         self.context_output_reserve_tokens = context_output_reserve_tokens
+        self.observability = observability
         self.logger = logger
         # Use LangChain's modern tool-calling interface. This maps to the
         # OpenAI-compatible `tools` payload supported by DeepSeek.
         self.llm_with_tools = self.llm.bind_tools(list(tools_dict.values()))
+
+    async def _invoke_llm(self, runnable: Any, messages: Any, *, name: str, metadata=None):
+        if self.observability is None:
+            return await runnable.ainvoke(messages)
+        return await self.observability.ainvoke(
+            runnable,
+            messages,
+            name=name,
+            model=getattr(self.llm, "model", None) or getattr(self.llm, "model_name", None),
+            metadata=metadata,
+        )
+
+    async def _invoke_tool(self, tool_name: str, operation, *, metadata=None, input_data=None):
+        if self.observability is None:
+            return await operation()
+        return await self.observability.tool_call(
+            f"tool.{tool_name}",
+            operation,
+            metadata=metadata,
+            input_data=input_data,
+        )
+
+    @staticmethod
+    def _parse_resume_payload(result: Any) -> Dict[str, Any] | None:
+        """Decode the full-resume envelope returned by the detail tool."""
+        if isinstance(result, dict) and result.get("kind") == "candidate_resume":
+            payload = dict(result)
+        elif isinstance(result, str):
+            try:
+                decoded = json.loads(result)
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(decoded, dict) or decoded.get("kind") != "candidate_resume":
+                return None
+            payload = decoded
+        else:
+            return None
+
+        if not payload.get("file_name") or not isinstance(payload.get("resume_text"), str):
+            return None
+        return payload
+
+    @staticmethod
+    def _parse_json_object(content: Any) -> Dict[str, Any] | None:
+        """Parse a JSON object from a model response with optional prose."""
+        raw = str(content or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw).strip()
+        try:
+            value = json.loads(raw)
+            return value if isinstance(value, dict) else None
+        except json.JSONDecodeError:
+            start = raw.find("{")
+            if start < 0:
+                return None
+            depth = 0
+            in_string = False
+            escaped = False
+            for index, char in enumerate(raw[start:], start):
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                elif char == '"':
+                    in_string = True
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            value = json.loads(raw[start:index + 1])
+                            return value if isinstance(value, dict) else None
+                        except json.JSONDecodeError:
+                            return None
+            return None
+
+    async def _summarize_resume_for_comparison(self, payload: Dict[str, Any]) -> str:
+        """Create compact context using rules first and LLM fallback second."""
+        candidate_id = payload.get("candidate_id") or payload.get("file_name")
+        candidate_name = payload.get("candidate_name") or candidate_id or "Unknown"
+        fields, missing = extract_resume_comparison_fields(
+            str(payload.get("resume_text") or ""),
+            candidate_name=str(candidate_name),
+            file_name=str(payload.get("file_name") or candidate_id or ""),
+        )
+        extraction_mode = "rules"
+
+        if missing:
+            instruction = """You fill missing fields in a resume comparison record.
+Extract only facts explicitly present in the resume. Return one JSON object with
+the requested fields; keep lists short and do not invent information. Existing
+fields are already extracted by deterministic rules and must not be rewritten.
+Only fill the missing fields listed below.
+"""
+            try:
+                response = await self._invoke_llm(
+                    self.llm,
+                    [
+                        SystemMessage(content=instruction),
+                        HumanMessage(
+                            content=(
+                                f"Candidate id: {candidate_id}\n"
+                                f"Candidate name: {candidate_name}\n"
+                                f"Missing fields: {', '.join(missing)}\n"
+                                f"Existing fields: {json.dumps(fields, ensure_ascii=False)}\n"
+                                f"Resume text:\n{payload.get('resume_text', '')}"
+                            )
+                        ),
+                    ],
+                    name="agent.resume_compression_fallback",
+                    metadata={
+                        "candidate_id": str(candidate_id or "")[:160],
+                        "resume_chars": len(str(payload.get("resume_text") or "")),
+                        "missing_fields": missing,
+                    },
+                )
+                parsed = self._parse_json_object(getattr(response, "content", ""))
+                if parsed:
+                    for field in missing:
+                        value = parsed.get(field)
+                        if value not in (None, "", [], {}):
+                            fields[field] = value
+                    # A fallback summary is useful only when rules did not
+                    # already construct one; preserve deterministic fields.
+                    if not fields.get("summary") and parsed.get("summary"):
+                        fields["summary"] = parsed["summary"]
+                    extraction_mode = "rules+llm_fallback"
+            except Exception as exc:
+                self.logger.warning(
+                    "[ToolExecutionNode] Resume fallback extraction failed for %s: %s",
+                    candidate_id,
+                    exc,
+                )
+                extraction_mode = "rules+fallback_failed"
+
+        fields["candidate_name"] = str(candidate_name)
+        fields["file_name"] = str(payload.get("file_name") or candidate_id or "")
+        return json.dumps(
+            {
+                "kind": "candidate_comparison_context",
+                "candidate_id": candidate_id,
+                "candidate_name": candidate_name,
+                "file_name": payload.get("file_name"),
+                "extraction": extraction_mode,
+                "missing_fields_after_extraction": [
+                    field for field in ("education", "skills", "experience", "projects")
+                    if not fields.get(field)
+                ],
+                "comparison": fields,
+            },
+            ensure_ascii=False,
+        )
+
+    def _tool_context_budget(self, state: AgentState) -> int:
+        """Estimate remaining room for a single full resume context."""
+        messages: List[Any] = [SystemMessage(content=self._get_system_message())]
+        memory_context = self._memory_context(state)
+        if memory_context:
+            messages.append(SystemMessage(content=memory_context))
+        facts_context = self._facts_context(state)
+        if facts_context:
+            messages.append(SystemMessage(content=facts_context))
+        messages.extend(self._history_messages(state))
+        messages.append(HumanMessage(content=state.get("user_question", "")))
+        messages.extend(state.get("messages", []))
+        used = sum(self._message_token_cost(message) for message in messages)
+        # Tool schemas and framing are not represented by LangChain messages;
+        # keep a conservative margin for them before inserting a full resume.
+        return max(
+            256,
+            self.context_window_tokens
+            - self.context_output_reserve_tokens
+            - used
+            - 1500,
+        )
+
+    async def _prepare_resume_contexts(
+        self,
+        state: AgentState,
+        resume_documents: List[Dict[str, Any]],
+        context_by_call_id: Dict[str, str],
+        comparison_contexts: Dict[str, str],
+    ) -> None:
+        """Prepare model-facing contexts while retaining full client documents.
+
+        A single detail lookup keeps the full resume available to reasoning.
+        Once more than one resume is involved, each full document is compressed
+        independently, so no reasoning turn receives several full resumes in
+        its ToolMessages. The original texts remain in ``resume_documents``.
+        """
+        if not resume_documents:
+            return
+
+        if len(resume_documents) == 1:
+            payload = resume_documents[0]
+            call_id = str(payload.get("tool_call_id") or payload.get("candidate_id"))
+            full_text = str(payload.get("resume_text") or "")
+            allowed = self._tool_context_budget(state)
+            if count_tokens(full_text) <= allowed:
+                context_by_call_id[call_id] = (
+                    f"Full resume details for {payload.get('file_name')}:\n\n{full_text}"
+                )
+            else:
+                context_by_call_id[call_id] = (
+                    f"Full resume details for {payload.get('file_name')} "
+                    f"(context excerpt; complete text is available to the client):\n\n"
+                    f"{trim_text_to_tokens(full_text, allowed)}"
+                )
+            return
+
+        pending = [
+            payload
+            for payload in resume_documents
+            if str(payload.get("tool_call_id") or payload.get("candidate_id"))
+            not in comparison_contexts
+        ]
+        if pending:
+            compressed = await asyncio.gather(
+                *(self._summarize_resume_for_comparison(payload) for payload in pending)
+            )
+            for payload, context in zip(pending, compressed):
+                call_id = str(payload.get("tool_call_id") or payload.get("candidate_id"))
+                comparison_contexts[call_id] = context
+
+        for payload in resume_documents:
+            call_id = str(payload.get("tool_call_id") or payload.get("candidate_id"))
+            context_by_call_id[call_id] = comparison_contexts[call_id]
+
+    @staticmethod
+    def _replace_resume_tool_messages(
+        messages: List[Any],
+        context_by_call_id: Dict[str, str],
+    ) -> List[Any]:
+        """Replace any earlier full resume ToolMessages with compact contexts."""
+        replaced: List[Any] = []
+        for message in messages:
+            call_id = getattr(message, "tool_call_id", None)
+            if isinstance(message, ToolMessage) and call_id in context_by_call_id:
+                replaced.append(
+                    ToolMessage(
+                        content=context_by_call_id[call_id],
+                        tool_call_id=call_id,
+                    )
+                )
+            else:
+                replaced.append(message)
+        return replaced
 
     def _normalize_tool_args(self, tool_name: str, tool_args: Any) -> Dict[str, Any]:
         """Normalize provider-specific arguments before execution/deduplication."""
@@ -230,7 +483,12 @@ content (a concise standalone memory), confidence (0-1), and importance (0-1).
 Save only durable user preferences, constraints, decisions, or facts explicitly requested for memory.
 Ignore one-off searches. If the user explicitly asks you to remember something, return action=create when a valid memory can be extracted."""
         try:
-            response = await self.llm.ainvoke([SystemMessage(content=f"{instruction}\nUser: {state['user_question']}\nAssistant: {answer}")])
+            response = await self._invoke_llm(
+                self.llm,
+                [SystemMessage(content=f"{instruction}\nUser: {state['user_question']}\nAssistant: {answer}")],
+                name="agent.memory_extraction",
+                metadata={"memory_enabled": True},
+            )
             item = self._parse_memory_decision(response.content)
             decision = MemoryExtractionDecision.model_validate(item)
             action = decision.action.lower()
@@ -364,7 +622,15 @@ Guidelines:
 
 7. Always provide accurate information from the database. Never guess or invent candidate details.
 
-8. If multiple candidates have the same name, ask the user for a distinguishing detail such as company, role, or filename."""
+8. If multiple candidates have the same name, ask the user for a distinguishing detail such as company, role, or filename.
+
+9. Full resume documents are returned to the client separately. In the final
+   answer, provide the requested conclusion and concrete evidence; do not
+   reproduce every resume verbatim unless the user explicitly asks for inline
+   text.
+
+10. Never replace a requested candidate with a similar name. If the exact
+    candidate cannot be resolved, report that fact and ask for clarification."""
     
     
     async def reasoning_node(self, state: AgentState) -> AgentState:
@@ -443,7 +709,16 @@ Guidelines:
 
             # Call the model with native tool schemas. The old `functions`
             # parameter is not reliably interpreted by DeepSeek-compatible APIs.
-            response = await self.llm_with_tools.ainvoke(limited_messages)
+            response = await self._invoke_llm(
+                self.llm_with_tools,
+                limited_messages,
+                name="agent.reasoning",
+                metadata={
+                    "iteration_count": iteration_count,
+                    "message_count": len(limited_messages),
+                    "tool_count": len(self.tools_dict),
+                },
+            )
 
             # Check if LLM wants to call a tool. Keep a legacy fallback for
             # providers that still return an OpenAI `function_call` payload.
@@ -524,6 +799,10 @@ Guidelines:
                 "tool_name": state.get("tool_name"),
                 "tool_arguments": state.get("tool_arguments"),
                 "tool_result": state.get("tool_result"),
+                "tool_context": state.get("tool_context"),
+                "tool_context_by_call_id": state.get("tool_context_by_call_id", {}),
+                "resume_documents": state.get("resume_documents", []),
+                "resume_comparison_contexts": state.get("resume_comparison_contexts", {}),
                 "error": state.get("error"),
                 "final_answer": state.get("final_answer"),
                 "iteration_count": iteration_count,
@@ -562,7 +841,7 @@ Guidelines:
             call_counts = dict(state.get("tool_call_counts", {}))
             executed = list(state.get("executed_tool_calls", []))
             messages = list(state.get("messages", []))
-            results = []
+            call_results = []
             used = []
             failed_ids = []
             duplicate = False
@@ -570,7 +849,7 @@ Guidelines:
             for call in pending:
                 tool_name = call["name"]
                 tool_args = self._normalize_tool_args(tool_name, call.get("args", {}))
-                call_id = call.get("id") or f"{tool_name}-{state.get('iteration_count', 0)}-{len(results)}"
+                call_id = call.get("id") or f"{tool_name}-{state.get('iteration_count', 0)}-{len(call_results)}"
                 signature = self._tool_call_signature(tool_name, tool_args)
                 if signature in executed or call_counts.get(tool_name, 0) >= state.get("max_tool_calls_per_tool", 2):
                     self.logger.warning("[ToolExecutionNode] Blocking duplicate/limited tool call: %s", signature)
@@ -583,45 +862,117 @@ Guidelines:
                     self.logger.info("[ToolExecutionNode] Executing tool: %s", tool_name)
                     tool = self.tools_dict[tool_name]
                     try:
-                        if tool.coroutine:
-                            result = await asyncio.wait_for(tool.coroutine(**tool_args), timeout=self.tool_timeout_seconds)
-                        elif hasattr(tool, "afunc"):
-                            result = await asyncio.wait_for(tool.afunc(**tool_args), timeout=self.tool_timeout_seconds)
-                        else:
-                            result = await asyncio.wait_for(asyncio.to_thread(tool.func, **tool_args), timeout=self.tool_timeout_seconds)
+                        async def execute_tool():
+                            if tool.coroutine:
+                                return await asyncio.wait_for(
+                                    tool.coroutine(**tool_args),
+                                    timeout=self.tool_timeout_seconds,
+                                )
+                            if hasattr(tool, "afunc"):
+                                return await asyncio.wait_for(
+                                    tool.afunc(**tool_args),
+                                    timeout=self.tool_timeout_seconds,
+                                )
+                            return await asyncio.wait_for(
+                                asyncio.to_thread(tool.func, **tool_args),
+                                timeout=self.tool_timeout_seconds,
+                            )
+
+                        result = await self._invoke_tool(
+                            tool_name,
+                            execute_tool,
+                            metadata={
+                                "argument_keys": sorted(tool_args.keys()),
+                                "iteration_count": state.get("iteration_count", 0),
+                            },
+                            input_data={"tool": tool_name, "arguments": tool_args},
+                        )
                     except asyncio.TimeoutError:
                         result = f"Error: Tool execution timed out after {self.tool_timeout_seconds:g}s: {tool_name}"
                         state["error"] = result
                     except Exception as exc:
                         result = f"Error executing tool {tool_name}: {exc}"
                         state["error"] = result
-                if tool_name == "get_candidate_details" and "Could not find" in result:
+                result_text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+                if tool_name == "get_candidate_details" and "Could not find" in result_text:
                     failed_ids.append(tool_args.get("identifier"))
-                results.append(result)
+                call_results.append((call_id, tool_name, result_text))
                 used.append(tool_name)
                 executed.append(signature)
                 call_counts[tool_name] = call_counts.get(tool_name, 0) + 1
-                messages.append(ToolMessage(content=result, tool_call_id=call_id))
 
-            state["tool_result"] = "\n\n".join(results) if results else state.get("tool_result")
+            # Full resume documents are retained for the API/UI, while the
+            # model-facing ToolMessages are rebuilt from compact contexts.
+            resume_documents = [dict(item) for item in state.get("resume_documents", [])]
+            resume_contexts = dict(state.get("resume_comparison_contexts", {}))
+            context_by_call_id = dict(state.get("tool_context_by_call_id", {}))
+            structured_facts = []
+            for call_id, tool_name, result_text in call_results:
+                payload = self._parse_resume_payload(result_text)
+                if payload is not None:
+                    payload["tool_call_id"] = call_id
+                    resume_documents = [
+                        item for item in resume_documents
+                        if str(item.get("tool_call_id")) != str(call_id)
+                    ]
+                    resume_documents.append(payload)
+                    context_by_call_id.pop(call_id, None)
+                    structured_facts.extend(
+                        item
+                        for item in (
+                            f"FILENAME: {payload.get('file_name', '')}",
+                            f"Name: {payload.get('candidate_name', '')}",
+                        )
+                        if item.rsplit(":", 1)[-1].strip()
+                    )
+                else:
+                    context_by_call_id[call_id] = result_text
+
+                # Keep the existing structured extraction for search/list
+                # tools. Resume envelopes are handled above without copying
+                # their raw prose into the facts block.
+                if payload is None:
+                    for line in result_text.splitlines():
+                        if re.match(
+                            r"^\s*(?:FILENAME|File|Name|Experience|Skills|Key Skills|"
+                            r"Relevance Score|Match Score|Full resume details for)\s*:",
+                            line,
+                            re.IGNORECASE,
+                        ):
+                            structured_facts.append(line)
+
+            await self._prepare_resume_contexts(
+                state,
+                resume_documents,
+                context_by_call_id,
+                resume_contexts,
+            )
+
+            # Earlier single-resume turns may have put full text into their
+            # ToolMessage. Once a second resume appears, replace those old
+            # messages too, so the next reasoning request never accumulates
+            # several full documents.
+            messages = self._replace_resume_tool_messages(messages, context_by_call_id)
+            for call_id, _tool_name, result_text in call_results:
+                messages.append(
+                    ToolMessage(
+                        content=context_by_call_id.get(call_id, result_text),
+                        tool_call_id=call_id,
+                    )
+                )
+
+            tool_context = "\n\n".join(
+                str(value) for value in context_by_call_id.values() if str(value or "").strip()
+            )
+            state["tool_context"] = tool_context or state.get("tool_context")
+            state["tool_result"] = state.get("tool_context")
             state["messages"] = messages
             state["tool_calls_made"] = [*state.get("tool_calls_made", []), *used]
             state["executed_tool_calls"] = executed
             state["tool_call_counts"] = call_counts
-            # Only retain structured candidate fields from tool output.  Do
-            # not copy arbitrary resume prose into the system fact block, both
-            # to keep it compact and to avoid treating untrusted text as an
-            # instruction.
-            structured_facts = []
-            for result in results:
-                for line in str(result or "").splitlines():
-                    if re.match(
-                        r"^\s*(?:FILENAME|File|Name|Experience|Skills|Key Skills|"
-                        r"Relevance Score|Match Score|Full resume details for)\s*:",
-                        line,
-                        re.IGNORECASE,
-                    ):
-                        structured_facts.append(line)
+            state["tool_context_by_call_id"] = context_by_call_id
+            state["resume_documents"] = resume_documents
+            state["resume_comparison_contexts"] = resume_contexts
             state["context_facts"] = merge_key_facts(
                 state.get("context_facts", []),
                 structured_facts,
@@ -634,6 +985,10 @@ Guidelines:
             return {
                 "needs_tool": False, "tool_name": None, "tool_arguments": None,
                 "pending_tool_calls": [], "tool_result": state.get("tool_result"),
+                "tool_context": state.get("tool_context"),
+                "tool_context_by_call_id": context_by_call_id,
+                "resume_documents": resume_documents,
+                "resume_comparison_contexts": resume_contexts,
                 "context_facts": state.get("context_facts", []),
                 "memory_extraction_skipped": state.get("memory_extraction_skipped", False),
                 "tool_calls_made": state.get("tool_calls_made", []),
@@ -689,9 +1044,14 @@ Guidelines:
             messages.append(HumanMessage(content=state["user_question"]))
             
             # Add any tool results
-            if state.get("tool_result"):
+            if state.get("tool_context") or state.get("tool_result"):
                 messages.append(HumanMessage(
-                    content=f"Based on this information: {state['tool_result']}\n\nPlease provide a helpful response."
+                    content=(
+                        "Based on the candidate/tool context below, provide a concise, "
+                        "evidence-grounded response. Do not reproduce full resume text "
+                        "because the client displays it separately.\n\n"
+                        f"{state.get('tool_context') or state.get('tool_result')}"
+                    )
                 ))
 
             limited_messages = self._fit_messages(
@@ -708,7 +1068,15 @@ Guidelines:
                 return state
             
             # Call LLM without function calling
-            response = await self.llm.ainvoke(limited_messages)
+            response = await self._invoke_llm(
+                self.llm,
+                limited_messages,
+                name="agent.response_generation",
+                metadata={
+                    "message_count": len(limited_messages),
+                    "has_tool_result": bool(state.get("tool_result")),
+                },
+            )
             
             state["final_answer"] = response.content
             
@@ -729,6 +1097,10 @@ Guidelines:
                 "tool_name": state.get("tool_name"),
                 "tool_arguments": state.get("tool_arguments"),
                 "tool_result": state.get("tool_result"),
+                "tool_context": state.get("tool_context"),
+                "tool_context_by_call_id": state.get("tool_context_by_call_id", {}),
+                "resume_documents": state.get("resume_documents", []),
+                "resume_comparison_contexts": state.get("resume_comparison_contexts", {}),
                 "error": state.get("error"),
                 "final_answer": state["final_answer"],
                 "iteration_count": state["iteration_count"],

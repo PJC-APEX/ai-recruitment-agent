@@ -1,9 +1,11 @@
 """RAG retrieval pipeline for searching resumes."""
 
+import asyncio
 import logging
 from typing import List, Dict, Any, Optional
 from app.services.vector_store_service import VectorStoreService
 from app.models.response_models import CandidateResult
+from app.utils.file_utils import extract_candidate_name_from_text
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,7 @@ class RetrievalPipeline:
                 results["ids"]
             ):
                 file_name = metadata.get("file_name", "unknown")
+                candidate_name = extract_candidate_name_from_text(doc) or metadata.get("candidate_name")
                 
                 # Calculate relevance score (1 - normalized distance)
                 # ChromaDB uses cosine distance, so lower is better
@@ -65,7 +68,7 @@ class RetrievalPipeline:
                 
                 if file_name not in candidates_map:
                     candidates_map[file_name] = {
-                        "candidate_name": metadata.get("candidate_name"),
+                        "candidate_name": candidate_name,
                         "file_name": file_name,
                         "skills": metadata.get("skills", []),
                         "years_experience": metadata.get("years_experience"),
@@ -77,6 +80,8 @@ class RetrievalPipeline:
                     if relevance_score > candidates_map[file_name]["relevance_score"]:
                         candidates_map[file_name]["relevance_score"] = relevance_score
                         candidates_map[file_name]["resume_snippet"] = doc[:200] + "..." if len(doc) > 200 else doc
+                        if candidate_name:
+                            candidates_map[file_name]["candidate_name"] = candidate_name
             
             # Convert to list and sort by relevance
             candidates = list(candidates_map.values())
@@ -99,8 +104,32 @@ class RetrievalPipeline:
             List of all candidates with their metadata
         """
         try:
-            # Get all metadata from vector store
+            # Start with metadata only. For identity resolution, fetch one
+            # representative chunk per file rather than loading every resume
+            # chunk into memory just to render the candidate list.
             all_metadata = await self.vector_store.get_all_metadata_async()
+            documents_by_file: Dict[str, str] = {}
+            if hasattr(self.vector_store, "get_by_metadata_async"):
+                file_names = sorted(
+                    {
+                        str(metadata.get("file_name"))
+                        for metadata in all_metadata
+                        if metadata.get("file_name")
+                    }
+                )
+
+                async def load_first_chunk(file_name: str):
+                    records = await self.vector_store.get_by_metadata_async(
+                        filter_metadata={"file_name": file_name},
+                        limit=1,
+                    )
+                    documents = records.get("documents") or []
+                    return file_name, documents[0] if documents else ""
+
+                loaded = await asyncio.gather(
+                    *(load_first_chunk(file_name) for file_name in file_names)
+                )
+                documents_by_file = dict(loaded)
             
             # Group by file_name to get unique candidates
             candidates_map = {}
@@ -108,8 +137,9 @@ class RetrievalPipeline:
             for metadata in all_metadata:
                 file_name = metadata.get("file_name")
                 if file_name and file_name not in candidates_map:
+                    document = documents_by_file.get(file_name, "")
                     candidates_map[file_name] = {
-                        "candidate_name": metadata.get("candidate_name"),
+                        "candidate_name": extract_candidate_name_from_text(document) or metadata.get("candidate_name"),
                         "file_name": file_name,
                         "skills": metadata.get("skills", []),
                         "years_experience": metadata.get("years_experience"),
@@ -151,8 +181,19 @@ class RetrievalPipeline:
             if not results["documents"]:
                 return None
             
-            # Combine all chunks for this resume
-            full_text = "\n\n".join(results["documents"])
+            # Combine chunks in source order and remove exact duplicate chunks.
+            # Older ingestion runs used non-deterministic IDs and can leave
+            # identical copies behind; those must not multiply the prompt.
+            records = list(zip(results["documents"], results.get("metadatas") or []))
+            records.sort(key=lambda item: int(item[1].get("chunk_index", 0)))
+            seen_documents: set[str] = set()
+            unique_documents = []
+            for document, _metadata in records:
+                if document in seen_documents:
+                    continue
+                seen_documents.add(document)
+                unique_documents.append(document)
+            full_text = "\n\n".join(unique_documents)
             return full_text
             
         except Exception as e:
@@ -172,15 +213,40 @@ class RetrievalPipeline:
             # First, get all candidates to find the file name
             all_candidates = await self.get_all_candidates()
             
-            # Search for matching candidate (case-insensitive)
-            matching_candidate = None
-            for candidate in all_candidates:
-                if candidate.candidate_name and candidate_name.lower() in candidate.candidate_name.lower():
-                    matching_candidate = candidate
-                    break
-            
-            if not matching_candidate:
+            query = self._normalize_candidate_identifier(candidate_name)
+            if not query:
                 return None
+
+            # Prefer an exact canonical name or filename match. Only allow a
+            # partial match when it is unique; never silently choose the first
+            # similarly named candidate.
+            exact = [
+                candidate
+                for candidate in all_candidates
+                if query in {
+                    self._normalize_candidate_identifier(candidate.candidate_name),
+                    self._normalize_candidate_identifier(candidate.file_name),
+                }
+            ]
+            matches = exact or [
+                candidate
+                for candidate in all_candidates
+                if candidate.candidate_name
+                and (
+                    query in self._normalize_candidate_identifier(candidate.candidate_name)
+                    or self._normalize_candidate_identifier(candidate.candidate_name) in query
+                )
+            ]
+            if len(matches) != 1:
+                if len(matches) > 1:
+                    self.logger.warning(
+                        "Ambiguous candidate name '%s' matched %d candidates",
+                        candidate_name,
+                        len(matches),
+                    )
+                return None
+
+            matching_candidate = matches[0]
             
             # Now get the full resume by filename
             resume_text = await self.get_resume_by_filename(matching_candidate.file_name)
@@ -192,3 +258,14 @@ class RetrievalPipeline:
         except Exception as e:
             self.logger.error(f"Error retrieving resume by candidate name: {str(e)}")
             return None
+
+    @staticmethod
+    def _normalize_candidate_identifier(value: Optional[str]) -> str:
+        """Normalize names and filenames for deterministic identity matching."""
+        import re
+
+        normalized = str(value or "").strip().lower()
+        normalized = re.sub(r"\.(?:pdf|docx?)$", "", normalized)
+        normalized = normalized.replace("简历", "").replace("resume", "")
+        normalized = re.sub(r"[\s_\-]+", "", normalized)
+        return normalized

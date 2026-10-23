@@ -1,215 +1,63 @@
-# Resume Screening and Matching System - Backend
+# 后端说明
 
-Production-ready AI-powered resume screening system using RAG (Retrieval Augmented Generation).
+FastAPI 后端负责简历摄取、ChromaDB 检索、岗位评分、LangGraph 招聘 Agent、会话检查点和长期记忆。LLM 与 Embedding 服务通过 OpenAI 兼容客户端配置；仓库提供 Azure OpenAI 环境变量示例。
 
-## Features
+## 本地启动
 
-- **Resume Upload**: Upload and parse PDF resumes
-- **Vector Search**: Semantic search using ChromaDB
-- **Resume Scoring**: Score resumes against job descriptions
-- **Candidate Ranking**: Rank candidates using LLM
-- **Chat Interface**: Natural language query support
+需要 Python 3.11 和可访问的聊天/Embedding 模型服务。
 
-## Tech Stack
-
-- **FastAPI**: Modern async web framework
-- **LangChain**: LLM orchestration
-- **OpenAI**: Embeddings and LLM
-- **ChromaDB**: Vector database
-- **PyPDF**: PDF parsing
-- **Pydantic**: Data validation
-
-## Setup
-
-### 1. Install Dependencies
-
-```bash
+```powershell
 cd backend
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-### 2. Configure Environment
+编辑 `.env`，填写 `AZURE_OPENAI_ENDPOINT`、`AZURE_OPENAI_API_KEY`、聊天模型与 Embedding 模型。启动：
 
-Copy `.env.example` to `.env` and add your OpenAI API key:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-```
-OPENAI_API_KEY=your_openai_api_key_here
-```
-
-### 3. Run the Server
-
-```bash
+```powershell
 python -m app.main
 ```
 
-Or with uvicorn:
+API 文档位于 <http://localhost:8000/docs>，健康检查为 `/health`。
 
-```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
+## API 路由
 
-The API will be available at: http://localhost:8000
+- `POST /api/upload-resume`：上传 PDF。同步模式下完成解析和向量化后返回；启用队列时返回 `job_id`。
+- `GET /api/upload-jobs/{job_id}`：查询摄取任务状态。
+- `GET /api/resumes/count`、`GET /api/resumes/list`：查询人才库。
+- `POST /api/search-resumes`：语义搜索。
+- `POST /api/score-resume`：岗位匹配评分。
+- `POST /api/rank-candidates`：检索候选人后进行逐人排序。
+- `POST /api/chat`：LangGraph Agent 对话。
+- `POST/GET/DELETE /api/memories`：长期记忆管理。
+- `POST /api/feishu/events`：可选飞书机器人回调。
 
-API Documentation: http://localhost:8000/docs
+实际 schema 以 FastAPI `/docs` 为准。
 
-## API Endpoints
+## 异步简历摄取
 
-### Resume Management
+本地开发可通过 `INGESTION_QUEUE_ENABLED=true` 和 `REDIS_URL` 开启 ARQ 队列。启动 worker：
 
-- `POST /api/upload-resume` - Upload a resume PDF
-- `GET /api/resumes/count` - Get total resume count
-- `GET /api/resumes/list` - List all resumes
-
-### Search & Query
-
-- `POST /api/search-resumes` - Search resumes with natural language
-- `POST /api/rank-candidates` - Rank candidates for a job
-- `POST /api/chat` - Chat interface for queries
-
-### Scoring
-
-- `POST /api/score-resume` - Score a resume against job description
-
-## Project Structure
-
-```
-backend/
-├── app/
-│   ├── main.py                 # FastAPI app entry point
-│   ├── config.py              # Configuration management
-│   ├── dependencies.py        # Dependency injection
-│   ├── api/
-│   │   ├── routes_resume.py   # Resume upload routes
-│   │   ├── routes_query.py    # Search and query routes
-│   │   └── routes_scoring.py  # Scoring routes
-│   ├── services/
-│   │   ├── resume_parser.py   # PDF parsing
-│   │   ├── chunking_service.py # Text chunking
-│   │   ├── embedding_service.py # Embeddings
-│   │   ├── vector_store_service.py # ChromaDB
-│   │   └── ranking_service.py  # Candidate ranking
-│   ├── llm/
-│   │   ├── llm_client.py      # OpenAI client
-│   │   └── prompt_templates.py # Prompt templates
-│   ├── rag/
-│   │   ├── retrieval_pipeline.py # RAG retrieval
-│   │   └── scoring_pipeline.py   # RAG scoring
-│   ├── models/
-│   │   ├── request_models.py  # Request schemas
-│   │   └── response_models.py # Response schemas
-│   └── utils/
-│       └── file_utils.py      # File utilities
-├── data/
-│   └── resumes/               # Uploaded resumes
-├── chroma_db/                 # ChromaDB persistence
-├── requirements.txt
-└── .env.example
-```
-
-## Example Usage
-
-### Upload a Resume
-
-```bash
-curl -X POST "http://localhost:8000/api/upload-resume" \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@resume.pdf"
-```
-
-### Search Resumes
-
-```bash
-curl -X POST "http://localhost:8000/api/search-resumes" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "query": "Find candidates with 5 years experience in Python and FastAPI",
-    "top_k": 5
-  }'
-```
-
-### Score a Resume
-
-```bash
-curl -X POST "http://localhost:8000/api/score-resume" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "resume_text": "...",
-    "job_description": "..."
-  }'
-```
-
-## Development
-
-### Running Tests
-
-```bash
-pytest tests/
-```
-
-### Code Quality
-
-```bash
-# Format code
-black app/
-
-# Check types
-mypy app/
-
-# Lint
-flake8 app/
-```
-
-## Configuration
-
-Edit `.env` or environment variables:
-
-```
-OPENAI_API_KEY=your_key
-CHUNK_SIZE=500
-CHUNK_OVERLAP=50
-TOP_K_RESULTS=5
-CHROMA_PERSIST_DIRECTORY=./chroma_db
-# Context safeguards (token estimates; no summarization LLM call)
-CONTEXT_WINDOW_TOKENS=32768
-CONTEXT_OUTPUT_RESERVE_TOKENS=2000
-MAX_USER_MESSAGE_TOKENS=8000
-SHORT_TERM_MAX_MESSAGES=20
-INGESTION_QUEUE_ENABLED=true
-REDIS_URL=redis://localhost:6379/0
-INGESTION_WORKER_MAX_JOBS=4
-INGESTION_EMBEDDING_CONCURRENCY=4
-INGESTION_EMBEDDING_BATCH_SIZE=16
-EMBEDDING_TIMEOUT_SECONDS=60
-EMBEDDING_MAX_RETRIES=5
-EMBEDDING_RETRY_MIN_SECONDS=1
-EMBEDDING_RETRY_MAX_SECONDS=20
-SYNC_THREAD_POOL_WORKERS=8
-```
-
-### Durable resume ingestion
-
-When `INGESTION_QUEUE_ENABLED=true`, `POST /api/upload-resume` only streams
-the file to `UPLOAD_DATA_DIRECTORY`, creates an idempotent job keyed by the
-SHA-256 file hash, and returns `job_id` with status `queued`. Start the ARQ
-worker from the `backend` directory:
-
-```bash
+```powershell
+cd backend
 python -m arq app.jobs.worker.WorkerSettings
 ```
 
-Poll `GET /api/upload-jobs/{job_id}` for `queued`, `processing`, `indexed`, or
-`failed`. The worker persists parsed text, metadata, chunks, and embeddings
-before advancing stages. Chroma IDs use `{file_hash}:{chunk_index}` and are
-upserted, so retries resume safely instead of duplicating vectors. API and
-worker processes must share `UPLOAD_DATA_DIRECTORY`, `CHROMA_PERSIST_DIRECTORY`
-and `INGESTION_ARTIFACT_DIRECTORY` (or replace local storage with S3/MinIO and
-an external vector database in a multi-host deployment).
+摄取任务按文件 SHA-256 幂等，解析文本、metadata、chunks 和 embeddings 分阶段保存，可通过 job 接口查看 `queued`、`processing`、`indexed` 或 `failed`。API 和 worker 必须共享上传目录、ChromaDB 目录和 `INGESTION_ARTIFACT_DIRECTORY`。当前根目录 Docker Compose 明确关闭队列，避免依赖未配置的 Redis。
 
-## License
+## 可选集成
 
-MIT
+飞书配置使用 `FEISHU_APP_ID`、`FEISHU_APP_SECRET` 和 `FEISHU_VERIFICATION_TOKEN`；如启用加密事件，还需设置 `FEISHU_ENCRYPT_KEY`。生产回调应设置验证 token。
+
+Langfuse 使用 `LANGFUSE_ENABLED=true` 及对应密钥启用 Agent、LLM 和工具调用观测。默认 `LANGFUSE_CAPTURE_CONTENT=false`，提示词和简历正文不会作为观测内容上传。配置在进程启动时读取，变更后需重启后端。
+
+## 测试
+
+```powershell
+cd backend
+python -m pytest tests -q
+```
+
+RAG evaluator 位于 `evals/run_rag_eval.py`。本地评测数据 `evals/rag_cases.jsonl` 和生成结果不应提交，因为它们可能包含真实候选人信息。

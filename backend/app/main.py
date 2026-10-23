@@ -6,7 +6,14 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
-from app.api import routes_resume, routes_query, routes_scoring, routes_memory
+from app.dependencies import get_observability
+from app.api import (
+    routes_feishu,
+    routes_resume,
+    routes_query,
+    routes_scoring,
+    routes_memory,
+)
 from app.jobs.ingestion_queue import close_arq_pool
 
 # Configure logging
@@ -57,6 +64,7 @@ app.include_router(routes_resume.router, prefix="/api", tags=["Resume"])
 app.include_router(routes_query.router, prefix="/api", tags=["Query"])
 app.include_router(routes_scoring.router, prefix="/api", tags=["Scoring"])
 app.include_router(routes_memory.router, prefix="/api", tags=["Memory"])
+app.include_router(routes_feishu.router, prefix="/api", tags=["Feishu"])
 
 
 @app.on_event("startup")
@@ -72,6 +80,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Application shutdown event."""
+    get_observability().flush()
     await close_arq_pool()
     logger.info("Shutting down application...")
 

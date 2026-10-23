@@ -61,3 +61,24 @@ def extract_candidate_name_from_filename(filename: str) -> Optional[str]:
     # Clean up extra spaces
     name_part = ' '.join(name_part.split()).strip()
     return name_part if name_part else None
+
+
+def extract_candidate_name_from_text(text: str) -> Optional[str]:
+    """Extract a candidate name from common resume header fields."""
+    import re
+
+    match = re.search(
+        r"(?:姓名|candidate\s*name|full\s*name|name)\s*[:：]\s*([^|｜\n,，;；]+)",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    value = re.sub(r"\s+", " ", match.group(1)).strip()
+    value = re.split(
+        r"\s+(?:性别|年龄|电话|邮箱|gender|age|phone|email)\s*[:：]",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    return value or None

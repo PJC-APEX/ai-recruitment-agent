@@ -1,0 +1,51 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - ./backend/.env
+    environment:
+      # Use container paths and keep application data outside the image.
+      CHROMA_PERSIST_DIRECTORY: /app/chroma_db
+      UPLOAD_DATA_DIRECTORY: /app/data/resumes
+      CHECKPOINT_DB_PATH: /app/data/checkpoints.sqlite
+      MEMORY_SQLITE_PATH: /app/data/memories.sqlite
+      INGESTION_ARTIFACT_DIRECTORY: /app/data/ingestion
+      # The first deployment is intentionally synchronous and does not need
+      # Redis. Explicitly clear a local-development REDIS_URL from .env so
+      # the container cannot accidentally try to connect to its own localhost.
+      INGESTION_QUEUE_ENABLED: "false"
+      REDIS_URL: ""
+      DEBUG: "false"
+    volumes:
+      - ./backend/chroma_db:/app/chroma_db
+      - ./backend/data:/app/data
+    expose:
+      - "8000"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      # Host Nginx (already installed on the server) will proxy HTTPS traffic
+      # to this local port. It is not exposed directly to the Internet.
+      - "127.0.0.1:8080:80"
+    restart: unless-stopped

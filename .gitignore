@@ -80,3 +80,11 @@ Thumbs.db
 # LangGraph runtime checkpoints
 backend/data/checkpoints.sqlite*
 backend/data/resumes/*.pdf
+
+# Local package exports, debug traces, and corpus-specific evaluation data
+backend/backend.zip
+frontend/fronted.zip
+backend/debug_output.txt
+backend/rag_eval_results.json
+backend/rag_eval_summary.json
+backend/evals/rag_cases.jsonl

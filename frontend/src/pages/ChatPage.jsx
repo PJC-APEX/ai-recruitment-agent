@@ -13,6 +13,7 @@ const ChatPage = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [candidates, setCandidates] = useState([]);
+  const [resumeDocuments, setResumeDocuments] = useState([]);
   const [showUpload, setShowUpload] = useState(false);
   const [sessionId] = useState(() => {
     const saved = localStorage.getItem('recruitment_session_id');
@@ -62,6 +63,9 @@ const ChatPage = () => {
       // Update candidates panel if candidates are returned
       if (response.data?.candidates) {
         setCandidates(response.data.candidates);
+      }
+      if (response.data?.resume_documents) {
+        setResumeDocuments(response.data.resume_documents);
       }
     } catch (error) {
       const errorMessage = {
@@ -225,14 +229,17 @@ const ChatPage = () => {
       </div>
 
       {/* Candidates Panel */}
-      {candidates.length > 0 && (
+      {(candidates.length > 0 || resumeDocuments.length > 0) && (
         <div className="w-96 bg-gray-800 border-l border-gray-700 flex flex-col">
           <div className="p-4 border-b border-gray-700 flex items-center justify-between">
             <h2 className="text-lg font-semibold text-white">
-              Candidates ({candidates.length})
+              Results
             </h2>
             <button
-              onClick={() => setCandidates([])}
+              onClick={() => {
+                setCandidates([]);
+                setResumeDocuments([]);
+              }}
               className="p-1 hover:bg-gray-700 rounded transition-colors"
               title="Close panel"
             >
@@ -252,9 +259,43 @@ const ChatPage = () => {
             </button>
           </div>
           <div className="flex-1 overflow-y-auto p-4 space-y-4">
-            {candidates.map((candidate, idx) => (
-              <CandidateCard key={idx} candidate={candidate} />
-            ))}
+            {candidates.length > 0 && (
+              <section>
+                <h3 className="text-sm font-semibold text-gray-300 mb-3">
+                  Candidates ({candidates.length})
+                </h3>
+                <div className="space-y-4">
+                  {candidates.map((candidate, idx) => (
+                    <CandidateCard key={idx} candidate={candidate} />
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {resumeDocuments.length > 0 && (
+              <section className="space-y-3">
+                <h3 className="text-sm font-semibold text-gray-300">
+                  Full resumes ({resumeDocuments.length})
+                </h3>
+                {resumeDocuments.map((document, idx) => (
+                  <details
+                    key={document.candidate_id || document.file_name || idx}
+                    className="bg-gray-900 rounded-lg border border-gray-700"
+                    open={resumeDocuments.length === 1}
+                  >
+                    <summary className="cursor-pointer px-3 py-3 text-sm text-white">
+                      {document.candidate_name || 'Unknown candidate'}
+                      <span className="block text-xs text-gray-500 mt-1">
+                        {document.file_name}
+                      </span>
+                    </summary>
+                    <pre className="px-3 pb-3 text-xs leading-5 text-gray-300 whitespace-pre-wrap break-words max-h-[32rem] overflow-y-auto">
+                      {document.resume_text || 'No resume text returned.'}
+                    </pre>
+                  </details>
+                ))}
+              </section>
+            )}
           </div>
         </div>
       )}

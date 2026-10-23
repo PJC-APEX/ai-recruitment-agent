@@ -179,13 +179,21 @@ async def chat(
         # Agent succeeded - return response
         response_text = result.get("response", "")
         tools_used = result.get("tools_used", [])
+        resume_documents = result.get("resume_documents", [])
         
         logger.info(f"Agent completed. Tools used: {tools_used}")
         
         return ChatResponse(
             message=request.message,
             response=response_text,
-            data={"agent_tools_used": tools_used} if tools_used else None
+            data=(
+                {
+                    "agent_tools_used": tools_used,
+                    "resume_documents": resume_documents,
+                }
+                if tools_used or resume_documents
+                else None
+            )
         )
         
     except Exception as e:

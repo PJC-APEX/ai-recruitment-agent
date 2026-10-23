@@ -6,12 +6,41 @@ This module defines tools following SOLID principles:
 - Interface Segregation: Clean, focused tool interfaces
 """
 
+import json
 import logging
+import re
 from typing import List, Dict, Any, Optional
 from langchain_core.tools import Tool
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_candidate_name(resume_text: str, fallback: str) -> str:
+    """Extract the name printed in a resume, falling back to the identifier.
+
+    Filenames are not reliable identities (for example, an uploaded file may
+    be named ``document1.pdf``), so the document payload carries the name from
+    the resume body when one is available.
+    """
+    match = re.search(
+        r"(?:姓名|candidate\s*name|full\s*name|name)\s*[:：]\s*([^|｜\n,，;；]+)",
+        str(resume_text or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return str(fallback or "").strip()
+
+    value = re.sub(r"\s+", " ", match.group(1)).strip()
+    # Resume headers often put the next field on the same line without a
+    # pipe, e.g. ``姓名：张三 性别：男 年龄：24``.
+    value = re.split(
+        r"\s+(?:性别|年龄|电话|邮箱|gender|age|phone|email)\s*[:：]",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    return value or str(fallback or "").strip()
 
 
 # Tool Input Schemas (Following Interface Segregation Principle)
@@ -170,12 +199,19 @@ def create_get_candidate_details_tool(retrieval_pipeline) -> Tool:
             if not resume_text:
                 return f"Could not find resume for: {identifier}. Please check the candidate name or file name."
             
-            # Truncate if too long
-            if len(resume_text) > 2000:
-                resume_text = resume_text[:2000] + "...\n[Resume truncated for brevity]"
-            
-            output = f"Full resume details for {file_name}:\n\n{resume_text}"
-            return output
+            # Keep the complete document in a machine-readable envelope. The
+            # graph decides whether the model should see the full text or a
+            # compact comparison context; the frontend can always display the
+            # original text without forcing it into a ToolMessage.
+            payload = {
+                "kind": "candidate_resume",
+                "candidate_id": file_name,
+                "candidate_name": _extract_candidate_name(resume_text, file_name),
+                "file_name": file_name,
+                "resume_text": resume_text,
+                "content_chars": len(resume_text),
+            }
+            return json.dumps(payload, ensure_ascii=False)
             
         except Exception as e:
             logger.error(f"Error in get_candidate_details tool: {str(e)}")

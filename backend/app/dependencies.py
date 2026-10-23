@@ -17,6 +17,13 @@ from app.agents.tools import (
     create_list_all_candidates_tool,
     create_get_candidate_details_tool
 )
+from app.observability.langfuse_client import LangfuseObservability
+
+
+@lru_cache()
+def get_observability() -> LangfuseObservability:
+    """Return the optional, process-wide observability adapter."""
+    return LangfuseObservability(get_settings())
 
 
 @lru_cache()
@@ -126,6 +133,7 @@ def get_recruitment_agent() -> RecruitmentAgent:
     retrieval_pipeline = get_retrieval_pipeline()
     settings = get_settings()
     memory_service = get_memory_service() if settings.memory_enabled else None
+    observability = get_observability()
     
     # Create tools (following Open/Closed Principle - easy to add more)
     tools = [
@@ -147,5 +155,6 @@ def get_recruitment_agent() -> RecruitmentAgent:
         max_user_message_tokens=settings.max_user_message_tokens,
         memory_service=memory_service,
         memory_top_k=settings.memory_top_k,
-        memory_min_confidence=settings.memory_min_confidence
+        memory_min_confidence=settings.memory_min_confidence,
+        observability=observability,
     )

@@ -27,7 +27,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.tools import Tool
 
 from app.agents.graph_state import AgentState, create_initial_state
-from app.agents.context_manager import count_tokens, fit_history, merge_key_facts
+from app.agents.context_manager import count_tokens, fit_history, merge_key_facts, trim_text_to_tokens
 from app.agents.workflow import create_recruitment_workflow
 
 logger = logging.getLogger(__name__)
@@ -68,7 +68,8 @@ class RecruitmentAgent:
         max_user_message_tokens: int = 8000,
         memory_service=None,
         memory_top_k: int = 5,
-        memory_min_confidence: float = 0.7
+        memory_min_confidence: float = 0.7,
+        observability=None,
     ):
         """Initialize the recruitment agent with LangGraph workflow.
         
@@ -95,6 +96,7 @@ class RecruitmentAgent:
         self.memory_service = memory_service
         self.memory_top_k = memory_top_k
         self.memory_min_confidence = memory_min_confidence
+        self.observability = observability
         self._checkpoint_lock = asyncio.Lock()
         self.logger = logger
         
@@ -108,6 +110,7 @@ class RecruitmentAgent:
             memory_top_k=memory_top_k, memory_min_confidence=memory_min_confidence,
             context_window_tokens=context_window_tokens,
             context_output_reserve_tokens=context_output_reserve_tokens,
+            observability=observability,
         ) if checkpointer is not None or not checkpoint_db_path else None
         
         self.logger.info(f"Initialized RecruitmentAgent with LangGraph workflow and {len(tools)} tools")
@@ -179,19 +182,20 @@ class RecruitmentAgent:
                             memory_min_confidence=self.memory_min_confidence,
                             context_window_tokens=self.context_window_tokens,
                             context_output_reserve_tokens=self.context_output_reserve_tokens,
+                            observability=self.observability,
                         )
             
             # A caller-provided session id enables persistent checkpoints. If
             # omitted, retain legacy one-shot behavior with an isolated thread.
             session_id = session_id or str(uuid.uuid4())
-            config = {"configurable": {"thread_id": session_id}}
+            checkpoint_config = {"configurable": {"thread_id": session_id}}
 
             if self.checkpointer is not None:
                 await self.checkpointer.setup()
 
             # Restore history for this thread, falling back to legacy history
             # supplied by older clients.
-            previous_state = await self.workflow.aget_state(config) if self.checkpointer is not None else None
+            previous_state = await self.workflow.aget_state(checkpoint_config) if self.checkpointer is not None else None
             persisted_history = previous_state.values.get("chat_history", []) if previous_state else []
             persisted_facts = previous_state.values.get("context_facts", []) if previous_state else []
             base_history = persisted_history or (chat_history or [])
@@ -219,8 +223,33 @@ class RecruitmentAgent:
             if self.verbose:
                 self.logger.info("[Agent] Starting LangGraph workflow execution")
             
-            # Execute the workflow - LangGraph handles the entire flow
-            final_state = await self.workflow.ainvoke(initial_state, config=config)
+            # Execute the workflow - LangGraph handles the entire flow. The
+            # observability callback is attached only to the execution config;
+            # checkpoint reads/writes remain free of tracing callbacks.
+            run_config = dict(checkpoint_config)
+            if self.observability is not None:
+                run_config.update(
+                    self.observability.runnable_config(
+                        session_id=session_id,
+                        user_id=user_id,
+                    )
+                )
+            with self._agent_observation(
+                session_id=session_id,
+                user_id=user_id,
+                query=query,
+            ) as agent_span:
+                final_state = await self.workflow.ainvoke(initial_state, config=run_config)
+                if self.observability is not None:
+                    self.observability.update(
+                        agent_span,
+                        metadata={
+                            "success": final_state.get("error") is None,
+                            "error": final_state.get("error"),
+                            "iteration_count": final_state.get("iteration_count", 0),
+                            "tools_used": final_state.get("tool_calls_made", []),
+                        },
+                    )
             
             # Extract results from final state
             final_answer = final_state.get("final_answer", "I couldn't generate a response.")
@@ -229,10 +258,36 @@ class RecruitmentAgent:
 
             # Checkpointing stores node outputs. Persist the assistant turn as
             # part of chat_history so the next request can restore it.
+            checkpoint_cleanup = {
+                # Full documents are response payloads, not durable
+                # conversation history. Keep the latest checkpoint compact so
+                # the next request cannot restore transient tool payloads.
+                "resume_documents": [],
+                "resume_comparison_contexts": {},
+                "tool_context": None,
+                "tool_context_by_call_id": {},
+                "tool_result": None,
+                "messages": [],
+                "pending_tool_calls": [],
+                "tool_name": None,
+                "tool_arguments": None,
+                "tool_calls_made": [],
+                "executed_tool_calls": [],
+                "tool_call_counts": {},
+                "duplicate_tool_call": False,
+                "last_tool_call_id": None,
+                "last_tool_name": None,
+                "last_tool_arguments": None,
+                "needs_tool": False,
+            }
             if final_answer and error is None and self.checkpointer is not None:
+                history_answer = self._history_answer(
+                    final_answer,
+                    final_state.get("resume_documents", []),
+                )
                 history_to_persist = [
                     *final_state.get("chat_history", merged_history),
-                    ("ai", final_answer),
+                    ("ai", history_answer),
                 ]
                 updated_history = fit_history(
                     history_to_persist,
@@ -246,8 +301,18 @@ class RecruitmentAgent:
                 # Update the persisted thread with the assistant turn. This
                 # creates a new checkpoint without rerunning the workflow.
                 await self.workflow.aupdate_state(
-                    config,
-                    {"chat_history": updated_history, "context_facts": updated_facts},
+                    checkpoint_config,
+                    {
+                        "chat_history": updated_history,
+                        "context_facts": updated_facts,
+                        **checkpoint_cleanup,
+                    },
+                )
+            elif self.checkpointer is not None:
+                # Also remove transient tool payloads after failed turns.
+                await self.workflow.aupdate_state(
+                    checkpoint_config,
+                    checkpoint_cleanup,
                 )
             
             if self.verbose:
@@ -259,7 +324,10 @@ class RecruitmentAgent:
             result = {
                 "response": final_answer,
                 "tools_used": tools_used,
-                "success": success
+                "success": success,
+                "resume_documents": self._public_resume_documents(
+                    final_state.get("resume_documents", [])
+                ),
             }
             
             if error:
@@ -278,6 +346,60 @@ class RecruitmentAgent:
                 "success": False,
                 "error": str(e)
             }
+
+    def _agent_observation(self, *, session_id: str, user_id: Optional[str], query: str):
+        """Create a redacted top-level Agent span when observability is enabled."""
+        if self.observability is None:
+            from contextlib import nullcontext
+
+            return nullcontext(None)
+        return self.observability.observation(
+            "recruitment_agent.process_query",
+            as_type="span",
+            session_id=session_id,
+            user_id=user_id,
+            metadata={
+                "query_chars": len(query or ""),
+                "query_tokens_estimate": self._count_tokens(query),
+            },
+        )
+
+    @staticmethod
+    def _public_resume_documents(documents: Any) -> List[Dict[str, Any]]:
+        """Expose full documents to the client without internal tool ids."""
+        public: List[Dict[str, Any]] = []
+        for document in documents or []:
+            if not isinstance(document, dict):
+                continue
+            item = dict(document)
+            item.pop("tool_call_id", None)
+            public.append(item)
+        return public
+
+    @staticmethod
+    def _history_answer(final_answer: str, documents: Any) -> str:
+        """Persist a compact reference instead of a complete resume answer."""
+        references = []
+        seen = set()
+        for document in documents or []:
+            if not isinstance(document, dict):
+                continue
+            file_name = str(document.get("file_name") or "").strip()
+            if not file_name or file_name in seen:
+                continue
+            seen.add(file_name)
+            name = str(document.get("candidate_name") or file_name).strip()
+            references.append(f"{name} ({file_name})")
+
+        concise_answer = trim_text_to_tokens(final_answer or "", 600)
+        if references:
+            return (
+                "Candidates loaded for this turn: "
+                + ", ".join(references)
+                + "\nAssistant conclusion: "
+                + concise_answer
+            )
+        return concise_answer
 
     def _count_tokens(self, text: str) -> int:
         """Count tokens using a conservative OpenAI-compatible encoding.

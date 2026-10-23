@@ -68,6 +68,18 @@ class AgentState(TypedDict):
     tool_result: Optional[str]
     """Result from tool execution"""
 
+    tool_context: Optional[str]
+    """Compact tool context sent back to the model after execution."""
+
+    tool_context_by_call_id: Dict[str, str]
+    """Model-facing context keyed by the provider tool-call id."""
+
+    resume_documents: List[Dict[str, Any]]
+    """Full resume payloads returned to the client, not replayed verbatim."""
+
+    resume_comparison_contexts: Dict[str, str]
+    """Compact comparison context keyed by resume tool-call id."""
+
     last_tool_name: Optional[str]
     """Name of the most recently executed tool, retained for context."""
 
@@ -146,6 +158,10 @@ def create_initial_state(
         tool_arguments=None,
         pending_tool_calls=[],
         tool_result=None,
+        tool_context=None,
+        tool_context_by_call_id={},
+        resume_documents=[],
+        resume_comparison_contexts={},
         last_tool_name=None,
         last_tool_arguments=None,
         last_tool_call_id=None,

@@ -33,6 +33,7 @@ def create_recruitment_workflow(
     memory_min_confidence: float = 0.7,
     context_window_tokens: int = 32768,
     context_output_reserve_tokens: int = 2000,
+    observability=None,
 ) -> StateGraph:
     """Create the LangGraph workflow for recruitment agent.
     
@@ -67,6 +68,7 @@ def create_recruitment_workflow(
         memory_min_confidence=memory_min_confidence,
         context_window_tokens=context_window_tokens,
         context_output_reserve_tokens=context_output_reserve_tokens,
+        observability=observability,
     )
     
     # Create the graph

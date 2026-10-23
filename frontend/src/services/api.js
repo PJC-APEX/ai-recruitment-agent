@@ -4,7 +4,9 @@
 
 import axios from 'axios';
 
-const API_BASE_URL = 'http://localhost:8000/api';
+// Use the same-origin reverse proxy in production. Vite's dev server proxy
+// keeps /api working locally without hard-coding localhost in the browser.
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 
 const api = axios.create({
   baseURL: API_BASE_URL,

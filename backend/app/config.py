@@ -95,6 +95,35 @@ class Settings(BaseSettings):
     ingestion_lock_ttl_seconds: int = 300
     ingestion_artifact_directory: str = "./data/ingestion"
     sync_thread_pool_workers: int = 8
+
+    # Optional Langfuse observability for Agent/LLM/tool performance.
+    # Disabled by default and configured through environment variables.
+    langfuse_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("LANGFUSE_ENABLED", "langfuse_enabled"),
+    )
+    langfuse_public_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("LANGFUSE_PUBLIC_KEY", "langfuse_public_key"),
+    )
+    langfuse_secret_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("LANGFUSE_SECRET_KEY", "langfuse_secret_key"),
+    )
+    langfuse_host: str = Field(
+        default="https://cloud.langfuse.com",
+        validation_alias=AliasChoices("LANGFUSE_HOST", "langfuse_host"),
+    )
+    langfuse_sample_rate: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        validation_alias=AliasChoices("LANGFUSE_SAMPLE_RATE", "langfuse_sample_rate"),
+    )
+    langfuse_capture_content: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("LANGFUSE_CAPTURE_CONTENT", "langfuse_capture_content"),
+    )
     
     # Chunking Configuration
     chunk_size: int = 500
@@ -102,6 +131,32 @@ class Settings(BaseSettings):
     
     # Retrieval Configuration
     top_k_results: int = 5
+
+    # Optional Feishu bot integration.  These values are intentionally
+    # optional so existing local/API deployments continue to work when the
+    # Feishu bot is not configured.
+    feishu_app_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("FEISHU_APP_ID", "feishu_app_id"),
+    )
+    feishu_app_secret: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("FEISHU_APP_SECRET", "feishu_app_secret"),
+    )
+    feishu_verification_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "FEISHU_VERIFICATION_TOKEN", "feishu_verification_token"
+        ),
+    )
+    feishu_encrypt_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("FEISHU_ENCRYPT_KEY", "feishu_encrypt_key"),
+    )
+    feishu_api_base_url: str = Field(
+        default="https://open.feishu.cn",
+        validation_alias=AliasChoices("FEISHU_API_BASE_URL", "feishu_api_base_url"),
+    )
     
     class Config:
         env_file = ".env"
